@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WA Lead Finder — Lamabot</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:      #0d0f18;
+  --surface: #161923;
+  --card:    #1c2030;
+  --border:  #252a3a;
+  --text:    #e8eaf0;
+  --muted:   #5a6075;
+  --muted2:  #7a8090;
+  --accent:  #25d366;
+  --blue:    #3b82f6;
+  --amber:   #f59e0b;
+  --red:     #ef4444;
+  --purple:  #a855f7;
+  --radius:  10px;
+  --mono:    'Courier New', monospace;
+
+  /* Tier colors */
+  --t1: #25d366;   /* green  — hot */
+  --t2: #f59e0b;   /* amber  — partial */
+  --t3: #3b82f6;   /* blue   — weak */
+  --t4: #5a6075;   /* muted  — out of range */
+}
+
+body { background: var(--bg); color: var(--text);
+       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+       font-size: 14px; min-height: 100vh; }
+
+.shell { display: flex; flex-direction: column; min-height: 100vh; }
+
+/* Header */
+header { padding: 14px 24px; border-bottom: 1px solid var(--border);
+         display: flex; align-items: center; gap: 12px;
+         background: var(--surface); position: sticky; top: 0; z-index: 100; }
+.logo { width: 32px; height: 32px; background: var(--accent); border-radius: 8px;
+        display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; }
+header h1 { font-size: 15px; font-weight: 600; }
+header span { font-size: 11px; color: var(--muted); margin-left: 4px; }
+.header-status { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.gemini-badge { display: flex; align-items: center; gap: 5px;
+                background: #a855f715; border: 1px solid #a855f730; border-radius: 20px;
+                padding: 3px 9px; font-size: 10px; color: #c084fc; font-weight: 600; }
+
+/* Layout */
+.main { display: flex; flex: 1; overflow: hidden; }
+
+/* Sidebar */
+.sidebar { width: 280px; min-width: 280px; background: var(--surface);
+           border-right: 1px solid var(--border); padding: 18px 16px;
+           display: flex; flex-direction: column; gap: 16px; overflow-y: auto; }
+.section-label { font-size: 10px; color: var(--muted2); font-weight: 700;
+                 text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 6px; }
+textarea, input[type=number], input[type=text] {
+  width: 100%; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text); padding: 8px 10px;
+  font-size: 12px; outline: none; transition: border-color 0.2s; }
+textarea { resize: vertical; min-height: 72px; font-family: var(--mono); line-height: 1.5; }
+textarea:focus, input:focus { border-color: var(--accent); }
+input[type=number], input[type=text] { height: 34px; }
+.hint { font-size: 10px; color: var(--muted); line-height: 1.5; margin-top: 4px; }
+
+.btn { width: 100%; height: 38px; border: none; border-radius: 8px;
+       font-size: 13px; font-weight: 600; cursor: pointer;
+       transition: opacity 0.15s, transform 0.1s;
+       display: flex; align-items: center; justify-content: center; gap: 7px; }
+.btn:active { transform: scale(0.98); }
+.btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.btn-primary { background: var(--accent); color: #000; }
+.btn-primary:hover:not(:disabled) { opacity: 0.88; }
+.btn-export { background: transparent; border: 1px solid var(--border); color: var(--text); }
+.btn-export:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.btn-stop { background: transparent; border: 1px solid #ef444450; color: var(--red); }
+.btn-stop:hover:not(:disabled) { background: #ef444415; }
+
+.stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.stat-box { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; }
+.stat-box b { display: block; font-size: 20px; color: var(--text); line-height: 1.1; }
+.stat-box span { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }
+.divider { border: none; border-top: 1px solid var(--border); }
+
+/* Tier summary bar (top of sidebar, shown after scan) */
+.tier-bar { display: none; flex-direction: column; gap: 6px; }
+.tier-bar.visible { display: flex; }
+.tier-row { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+.tier-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.tier-row b { font-size: 13px; min-width: 24px; text-align: right; }
+
+/* Content */
+.content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+/* Progress panel */
+.progress-panel { display: none; background: var(--surface); border-bottom: 1px solid var(--border);
+                  padding: 16px 20px; gap: 14px; flex-direction: column; }
+.progress-panel.visible { display: flex; }
+.progress-header { display: flex; align-items: center; gap: 10px; }
+.progress-title { font-size: 13px; font-weight: 600; }
+.progress-sub { font-size: 11px; color: var(--muted2); margin-left: auto; }
+.stages { display: flex; gap: 8px; flex-wrap: wrap; }
+.stage-pill { display: flex; align-items: center; gap: 6px; background: var(--bg);
+              border: 1px solid var(--border); border-radius: 20px; padding: 4px 10px;
+              font-size: 11px; color: var(--muted2); transition: all 0.3s; }
+.stage-pill.active { border-color: var(--accent); color: var(--accent); background: #25d36615; }
+.stage-pill.done   { border-color: #25d36640; color: #4ade80; background: #25d36610; }
+.prog-bar-wrap { background: var(--bg); border-radius: 6px; height: 4px; overflow: hidden; }
+.prog-bar { height: 100%; background: var(--accent); border-radius: 6px; transition: width 0.4s ease; width: 0%; }
+.tag-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.tag-chip { display: flex; align-items: center; gap: 4px; background: var(--bg);
+            border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px;
+            font-size: 10px; color: var(--muted2); font-family: var(--mono); transition: all 0.3s; }
+.tag-chip.scanning { border-color: var(--amber); color: var(--amber); background: #f59e0b10; }
+.tag-chip.done { border-color: #25d36640; color: #4ade80; background: #25d36608; }
+.tag-chip.done::before { content: "✓ "; }
+.tag-chip.scanning::after { content: " …"; }
+.tag-count { font-size: 9px; color: var(--muted); }
+.log-stream { background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+              padding: 8px 12px; font-family: var(--mono); font-size: 10px; color: var(--muted2);
+              max-height: 80px; overflow-y: auto; line-height: 1.6; }
+.log-line { display: flex; gap: 8px; }
+.log-line .ts { color: var(--muted); flex-shrink: 0; }
+.log-line.ok   .msg { color: #4ade80; }
+.log-line.info .msg { color: var(--text); }
+.log-line.warn .msg { color: var(--amber); }
+.log-line.skip .msg { color: var(--muted2); }
+.log-line.gemini .msg { color: #c084fc; }
+.gemini-row { display: flex; align-items: center; gap: 10px; }
+.gemini-prog-text { font-size: 11px; color: var(--muted2); }
+.gemini-count { font-weight: 600; color: var(--purple); }
+
+/* Results */
+.results-area { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 0; }
+.error-box { background: #ef444415; border: 1px solid #ef444440; border-radius: 8px;
+             padding: 11px 14px; color: #fca5a5; font-size: 12px; margin: 14px 20px;
+             display: none; }
+.error-box.visible { display: block; }
+.empty { text-align: center; padding: 80px 20px; color: var(--muted); }
+.empty .icon { font-size: 48px; margin-bottom: 16px; }
+.empty p { font-size: 15px; margin-bottom: 6px; color: var(--text); }
+
+/* Filter tabs */
+.filter-bar { display: none; align-items: center; gap: 8px; padding: 12px 20px;
+              border-bottom: 1px solid var(--border); background: var(--surface);
+              flex-wrap: wrap; }
+.filter-bar.visible { display: flex; }
+.tab { display: flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 20px;
+       border: 1px solid var(--border); background: transparent; color: var(--muted2);
+       font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+.tab.active { border-color: var(--accent); color: var(--accent); background: #25d36615; }
+.tab .tc { font-size: 10px; font-weight: 400; opacity: 0.7; }
+.tab[data-tier="1"].active { border-color: var(--t1); color: var(--t1); background: #25d36615; }
+.tab[data-tier="2"].active { border-color: var(--t2); color: var(--t2); background: #f59e0b15; }
+.tab[data-tier="3"].active { border-color: var(--t3); color: var(--t3); background: #3b82f615; }
+.tab[data-tier="4"].active { border-color: var(--t4); color: var(--t4); background: #5a607515; }
+
+/* Table */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+thead th { text-align: left; padding: 8px 10px; font-size: 9px; font-weight: 700;
+           text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted);
+           border-bottom: 1px solid var(--border); white-space: nowrap;
+           background: var(--surface); position: sticky; top: 0; z-index: 1; }
+tbody tr { border-bottom: 1px solid var(--border); transition: background 0.1s; }
+tbody tr:hover { background: var(--surface); }
+tbody tr.new-row { animation: fadeIn 0.25s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+td { padding: 7px 10px; vertical-align: middle; }
+
+/* Tier header rows */
+tr.tier-hdr td { padding: 8px 10px; font-size: 10px; font-weight: 700;
+                 text-transform: uppercase; letter-spacing: 0.5px;
+                 border-top: 2px solid; border-bottom: 1px solid; }
+tr.tier-hdr.t1 td { color: var(--t1); border-color: #25d36630; background: #25d36608; }
+tr.tier-hdr.t2 td { color: var(--t2); border-color: #f59e0b30; background: #f59e0b08; }
+tr.tier-hdr.t3 td { color: var(--t3); border-color: #3b82f630; background: #3b82f608; }
+tr.tier-hdr.t4 td { color: var(--t4); border-color: #5a607530; background: #5a607508; }
+
+/* Tier row left-border accent */
+tr.tier-row { border-left: 3px solid transparent; }
+tr.tier-row.t1 { border-left-color: #25d36640; }
+tr.tier-row.t2 { border-left-color: #f59e0b40; }
+tr.tier-row.t3 { border-left-color: #3b82f640; }
+tr.tier-row.t4 { border-left-color: #5a607540; opacity: 0.65; }
+
+/* Badges */
+.page-name { color: var(--accent); text-decoration: none; font-weight: 600; white-space: nowrap; font-size: 12px; }
+.page-name:hover { text-decoration: underline; }
+.biz-name { font-size: 10px; color: var(--muted2); margin-top: 2px; }
+.wa-link { color: var(--accent); font-weight: 600; font-size: 11px; white-space: nowrap; }
+.cat-badge { display: inline-block; padding: 2px 7px; border-radius: 100px; font-size: 9px;
+             font-weight: 700; background: #25d36615; color: #4ade80; border: 1px solid #25d36625; white-space: nowrap; }
+.city-badge { display: inline-flex; align-items: center; gap: 3px; font-size: 10px; color: var(--blue);
+              background: #3b82f610; border: 1px solid #3b82f620; border-radius: 6px; padding: 1px 6px; white-space: nowrap; }
+.conf-badge { display: inline-block; padding: 2px 6px; border-radius: 6px; font-size: 9px; font-weight: 700; white-space: nowrap; }
+.conf-high { background: #25d36618; color: #4ade80; border: 1px solid #25d36630; }
+.conf-med  { background: #f59e0b15; color: var(--amber); border: 1px solid #f59e0b30; }
+.conf-low  { background: #ef444415; color: #fca5a5; border: 1px solid #ef444430; }
+.conf-na   { background: #5a607515; color: var(--muted2); border: 1px solid #5a607530; }
+.stat-num { font-weight: 600; color: var(--text); white-space: nowrap; font-size: 12px; }
+.stat-sub { font-size: 10px; color: var(--muted2); }
+.bio-cell { max-width: 160px; color: var(--muted2); font-size: 10px;
+            overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+
+/* Signal pills */
+.signals { display: flex; flex-wrap: wrap; gap: 3px; max-width: 200px; }
+.sig { font-size: 9px; padding: 1px 5px; border-radius: 4px; white-space: nowrap; }
+.sig.met     { background: #25d36610; color: #4ade80; border: 1px solid #25d36625; }
+.sig.missing { background: #ef444410; color: #fca5a5; border: 1px solid #ef444425; }
+
+.spinner { width: 13px; height: 13px; border: 2px solid var(--border);
+           border-top-color: var(--accent); border-radius: 50%;
+           animation: spin 0.7s linear infinite; flex-shrink: 0; display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <header>
+    <div class="logo">📲</div>
+    <h1>WA Lead Finder <span>by Lamabot</span></h1>
+    <div class="header-status">
+      <div class="gemini-badge">✦ Gemini 2.5 Flash validated</div>
+    </div>
+  </header>
+
+  <div class="main">
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+
+      <div>
+        <div class="section-label">Niche / Product Type</div>
+        <input type="text" id="niche" placeholder="e.g. sweets and pickles, handmade jewellery…">
+        <div class="hint">Gemini uses this to validate each profile</div>
+      </div>
+
+      <div>
+        <div class="section-label">Hashtags to scan</div>
+        <textarea id="hashtags" placeholder="hyderabadfood, telugusweets, andhrapickles…"></textarea>
+        <div class="hint">Comma-separated, without #</div>
+      </div>
+
+      <div>
+        <div class="section-label">Search keywords <span style="color:var(--muted);font-weight:400">(optional)</span></div>
+        <textarea id="search_keywords" placeholder="leave blank to auto-build from niche + geo"></textarea>
+        <div class="hint">Finds accounts hashtags miss. Leave blank to auto-build.</div>
+      </div>
+
+      <div>
+        <div class="section-label">Geo filter <span style="color:var(--muted);font-weight:400">(optional)</span></div>
+        <input type="text" id="geo_filter" placeholder="hyderabad, telangana, andhra…">
+        <div class="hint">Only show profiles mentioning these locations</div>
+      </div>
+
+      <div style="display:flex;align-items:flex-start;gap:8px;margin-top:4px;">
+        <input type="checkbox" id="debug_mode" style="margin-top:3px;width:auto;">
+        <label for="debug_mode" style="cursor:pointer;">
+          <div class="section-label" style="margin:0;">Show all tiers in export</div>
+          <div class="hint" style="margin-top:2px;">Run Gemini on tier-2 as well, include all profiles in CSV</div>
+        </label>
+      </div>
+
+      <hr class="divider">
+
+      <div>
+        <div class="section-label">Max hot leads (10–200)</div>
+        <input type="number" id="limit" value="50" min="10" max="200">
+      </div>
+
+      <div style="display:flex;gap:10px;">
+        <div style="flex:1;">
+          <div class="section-label">Min followers</div>
+          <input type="number" id="min_followers" value="10000" min="0" step="100">
+        </div>
+        <div style="flex:1;">
+          <div class="section-label">Max followers</div>
+          <input type="number" id="max_followers" value="500000" min="0" step="1000">
+        </div>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-box"><b id="stat-total">0</b><span>Profiles</span></div>
+        <div class="stat-box"><b id="stat-hot">0</b><span>🔥 Hot</span></div>
+        <div class="stat-box"><b id="stat-partial">0</b><span>⚡ Partial</span></div>
+        <div class="stat-box"><b id="stat-weak">0</b><span>🔍 Weak</span></div>
+      </div>
+
+      <button class="btn btn-primary" id="btn-scan" onclick="startScan()">▶  Start scan</button>
+      <button class="btn btn-stop"    id="btn-stop" onclick="stopScan()" style="display:none">■  Stop</button>
+      <button class="btn btn-export"  id="btn-export" onclick="exportCsv()" disabled>⬇  Export CSV</button>
+
+    </aside>
+
+    <!-- Right side -->
+    <div class="content">
+
+      <!-- Progress panel -->
+      <div class="progress-panel" id="progress-panel">
+        <div class="progress-header">
+          <div class="spinner" id="main-spinner"></div>
+          <div class="progress-title" id="prog-title">Initialising…</div>
+          <div class="progress-sub"   id="prog-sub"></div>
+        </div>
+        <div class="stages">
+          <div class="stage-pill" id="stage-hashtag"><span>🔍</span> Hashtag scan</div>
+          <div class="stage-pill" id="stage-profiles"><span>👤</span> Profile fetch</div>
+          <div class="stage-pill" id="stage-filter"><span>⚡</span> Scoring</div>
+          <div class="stage-pill" id="stage-gemini"><span>✦</span> Gemini validate</div>
+        </div>
+        <div id="tag-list-wrap" style="display:none">
+          <div class="section-label" style="margin-bottom:6px">Hashtags</div>
+          <div class="tag-list" id="tag-list"></div>
+        </div>
+        <div id="progbar-wrap" style="display:none">
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+            <span class="gemini-prog-text" id="gemini-prog-text">Validating…</span>
+            <span class="gemini-prog-text"><span class="gemini-count" id="gemini-done">0</span> / <span id="gemini-total">?</span></span>
+          </div>
+          <div class="prog-bar-wrap"><div class="prog-bar" id="prog-bar"></div></div>
+        </div>
+        <div class="log-stream" id="log-stream"></div>
+      </div>
+
+      <!-- Filter tabs (shown after scan) -->
+      <div class="filter-bar" id="filter-bar">
+        <span style="font-size:10px;color:var(--muted2);font-weight:700;text-transform:uppercase;letter-spacing:0.6px">Show:</span>
+        <button class="tab active" data-tier="0" onclick="setFilter(0)">All <span class="tc" id="tc-all"></span></button>
+        <button class="tab" data-tier="1" onclick="setFilter(1)">🔥 Hot <span class="tc" id="tc-1"></span></button>
+        <button class="tab" data-tier="2" onclick="setFilter(2)">⚡ Partial <span class="tc" id="tc-2"></span></button>
+        <button class="tab" data-tier="3" onclick="setFilter(3)">🔍 Weak <span class="tc" id="tc-3"></span></button>
+        <button class="tab" data-tier="4" onclick="setFilter(4)">⬇ Out of range <span class="tc" id="tc-4"></span></button>
+      </div>
+
+      <!-- Results -->
+      <div class="results-area">
+        <div class="error-box" id="error-box"></div>
+        <div id="empty-state" class="empty">
+          <div class="icon">📡</div>
+          <p>No profiles yet</p>
+          <small>Enter your niche, add hashtags, and hit Start scan</small>
+        </div>
+        <div class="table-wrap" id="table-wrap" style="display:none">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Page / Business</th>
+                <th>Category</th>
+                <th>City</th>
+                <th>WhatsApp</th>
+                <th>Conf.</th>
+                <th>Followers</th>
+                <th>Posts</th>
+                <th>Biz</th>
+                <th>Signals</th>
+                <th>Bio</th>
+              </tr>
+            </thead>
+            <tbody id="leads-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let allProfiles = [];   // every profile with tier info
+let skippedN    = 0;
+let scanning    = false;
+let stopFlag    = false;
+let reader      = null;
+let tagChips    = {};
+let activeFilter = 0;  // 0 = all tiers
+
+const TIER_COLOR = { 1: 'var(--t1)', 2: 'var(--t2)', 3: 'var(--t3)', 4: 'var(--t4)' };
+
+// ── Tag chips ─────────────────────────────────────────────────────────────────
+function initTagChips(hashtags) {
+  const list = document.getElementById('tag-list');
+  const wrap = document.getElementById('tag-list-wrap');
+  list.innerHTML = ''; tagChips = {};
+  if (!hashtags || !hashtags.length) { wrap.style.display = 'none'; return; }
+  wrap.style.display = '';
+  hashtags.forEach(tag => {
+    const chip = document.createElement('div');
+    chip.className = 'tag-chip scanning'; chip.id = `chip-${tag}`;
+    chip.textContent = `#${tag}`; list.appendChild(chip); tagChips[tag] = chip;
+  });
+}
+function markTagDone(tag, count) {
+  const chip = tagChips[tag]; if (!chip) return;
+  chip.className = 'tag-chip done';
+  chip.innerHTML = `#${tag} <span class="tag-count">${count}</span>`;
+}
+
+// ── Log stream ────────────────────────────────────────────────────────────────
+function addLog(msg, type = 'info') {
+  const stream = document.getElementById('log-stream');
+  const ts = new Date().toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  const line = document.createElement('div');
+  line.className = `log-line ${type}`;
+  line.innerHTML = `<span class="ts">${ts}</span><span class="msg">${esc(msg)}</span>`;
+  stream.appendChild(line); stream.scrollTop = stream.scrollHeight;
+  while (stream.children.length > 80) stream.removeChild(stream.firstChild);
+}
+
+// ── Stage pills ───────────────────────────────────────────────────────────────
+function setStageActive(id) {
+  ['stage-hashtag','stage-profiles','stage-filter','stage-gemini'].forEach(s => {
+    const el = document.getElementById(s); el.classList.remove('active','done');
+    if (s === id) el.classList.add('active');
+  });
+}
+function setStagesDone(...ids) {
+  ids.forEach(id => { const el = document.getElementById(id); el.classList.remove('active'); el.classList.add('done'); });
+}
+
+// ── Filter tabs ───────────────────────────────────────────────────────────────
+function setFilter(tier) {
+  activeFilter = tier;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelector(`.tab[data-tier="${tier}"]`).classList.add('active');
+  renderTable();
+}
+
+function updateTabCounts() {
+  const counts = {1:0,2:0,3:0,4:0};
+  allProfiles.forEach(p => counts[p.tier] = (counts[p.tier]||0)+1);
+  const total = allProfiles.length;
+  document.getElementById('tc-all').textContent = total ? `(${total})` : '';
+  [1,2,3,4].forEach(t => {
+    const el = document.getElementById(`tc-${t}`);
+    if (el) el.textContent = counts[t] ? `(${counts[t]})` : '';
+  });
+  document.getElementById('stat-total').textContent   = total;
+  document.getElementById('stat-hot').textContent     = counts[1] || 0;
+  document.getElementById('stat-partial').textContent = counts[2] || 0;
+  document.getElementById('stat-weak').textContent    = counts[3] || 0;
+}
+
+// ── Render full table (called after filter change or new data) ────────────────
+function renderTable() {
+  const tbody = document.getElementById('leads-body');
+  tbody.innerHTML = '';
+
+  const visible = activeFilter === 0
+    ? allProfiles
+    : allProfiles.filter(p => p.tier === activeFilter);
+
+  if (!visible.length) { return; }
+
+  document.getElementById('table-wrap').style.display = '';
+  document.getElementById('empty-state').style.display = 'none';
+
+  // Group by tier, emit header then rows
+  let lastTier = null;
+  const tierLabels = {
+    1: '🔥 Hot Leads — all requirements met',
+    2: '⚡ Partial Match — WA signal present, geo missing',
+    3: '🔍 Weak Signal — in follower range but no WA',
+    4: '⬇ Out of Range — wrong follower count / verified / big brand',
+  };
+
+  visible.forEach((item, idx) => {
+    if (item.tier !== lastTier) {
+      lastTier = item.tier;
+      const hdr = document.createElement('tr');
+      hdr.className = `tier-hdr t${item.tier}`;
+      const tierCount = visible.filter(p => p.tier === item.tier).length;
+      hdr.innerHTML = `<td colspan="11">${tierLabels[item.tier]} &nbsp;<span style="font-weight:400;opacity:0.7">(${tierCount})</span></td>`;
+      tbody.appendChild(hdr);
+    }
+    const tr = buildRow(item, idx + 1);
+    tbody.appendChild(tr);
+  });
+}
+
+// ── Build a single table row ──────────────────────────────────────────────────
+function buildRow(item, n) {
+  const p  = item.profile;
+  const tr = document.createElement('tr');
+  tr.className = `tier-row t${item.tier} new-row`;
+
+  const waDisplay = p.whatsapp_number
+    ? `<a class="wa-link" href="https://wa.me/${p.whatsapp_number.replace(/\D/g,'')}" target="_blank">📱 ${esc(p.whatsapp_number)}</a>`
+    : `<span style="color:var(--muted)">—</span>`;
+
+  const cityDisplay = p.city
+    ? `<span class="city-badge">📍 ${esc(p.city)}</span>`
+    : `<span style="color:var(--muted)">—</span>`;
+
+  let confClass = 'conf-na';
+  if (p.confidence === 'high')   confClass = 'conf-high';
+  else if (p.confidence === 'medium') confClass = 'conf-med';
+  else if (p.confidence === 'low')    confClass = 'conf-low';
+
+  // Gemini verdict indicator
+  let verdictIcon = '';
+  if (p.gemini_valid === true)  verdictIcon = ' <span style="color:#4ade80;font-size:10px">✓ AI</span>';
+  if (p.gemini_valid === false) verdictIcon = ' <span style="color:#fca5a5;font-size:10px">✗ AI</span>';
+
+  // Signal pills
+  const metHtml     = (p.met     || []).map(s => `<span class="sig met">${esc(s)}</span>`).join('');
+  const missingHtml  = (p.missing || []).map(s => `<span class="sig missing">${esc(s)}</span>`).join('');
+
+  tr.innerHTML = `
+    <td style="color:var(--muted);font-size:10px">${n}</td>
+    <td>
+      <a class="page-name" href="${esc(p.ig_url)}" target="_blank">${esc(p.page_name)}</a>
+      <div class="biz-name">${esc(p.business_name)}</div>
+    </td>
+    <td>${p.business_category !== '—' ? `<span class="cat-badge">${esc(p.business_category)}</span>` : '<span style="color:var(--muted)">—</span>'}</td>
+    <td>${cityDisplay}</td>
+    <td>${waDisplay}</td>
+    <td><span class="conf-badge ${confClass}">${esc(p.confidence)}${verdictIcon}</span></td>
+    <td><div class="stat-num">${fmtNum(p.followers)}</div></td>
+    <td><div class="stat-sub">${p.total_posts || '—'}</div></td>
+    <td style="font-size:10px;color:${p.is_business_acct==='Yes'?'var(--accent)':'var(--muted)'}">
+      ${p.is_business_acct === 'Yes' ? '✓' : '—'}
+    </td>
+    <td><div class="signals">${metHtml}${missingHtml}</div></td>
+    <td class="bio-cell" title="${esc(p.bio)}">${esc(p.bio || '—')}</td>
+  `;
+  return tr;
+}
+
+// ── Start / Stop ──────────────────────────────────────────────────────────────
+function startScan() {
+  const niche         = document.getElementById('niche').value.trim();
+  const hashtagRaw    = document.getElementById('hashtags').value.trim();
+  const geo_filter    = document.getElementById('geo_filter').value.trim();
+  const limit         = parseInt(document.getElementById('limit').value) || 50;
+  const debug_mode    = document.getElementById('debug_mode').checked;
+  const search_kw     = document.getElementById('search_keywords').value.trim();
+  const min_followers = parseInt(document.getElementById('min_followers').value) || 0;
+  const max_followers = parseInt(document.getElementById('max_followers').value) || 500000;
+
+  if (!hashtagRaw && !search_kw && !(niche && geo_filter)) {
+    alert('Enter hashtags, search keywords, or a niche + geo filter.'); return;
+  }
+  if (!niche) { alert('Please enter a niche.'); return; }
+  if (min_followers > max_followers) { alert('Min followers can\'t exceed max followers.'); return; }
+
+  const hashtags = hashtagRaw.split(',').map(t => t.trim().replace(/^#/,'')).filter(Boolean);
+
+  allProfiles = []; skippedN = 0; stopFlag = false; scanning = true; activeFilter = 0;
+
+  document.getElementById('leads-body').innerHTML = '';
+  document.getElementById('table-wrap').style.display  = 'none';
+  document.getElementById('empty-state').style.display = 'none';
+  document.getElementById('error-box').classList.remove('visible');
+  document.getElementById('filter-bar').classList.remove('visible');
+  document.getElementById('stat-total').textContent = document.getElementById('stat-hot').textContent =
+    document.getElementById('stat-partial').textContent = document.getElementById('stat-weak').textContent = '0';
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelector('.tab[data-tier="0"]').classList.add('active');
+
+  document.getElementById('btn-scan').style.display  = 'none';
+  document.getElementById('btn-stop').style.display  = '';
+  document.getElementById('btn-export').disabled     = true;
+  document.getElementById('progress-panel').classList.add('visible');
+  document.getElementById('main-spinner').style.display = '';
+  document.getElementById('log-stream').innerHTML = '';
+  document.getElementById('progbar-wrap').style.display = 'none';
+  document.getElementById('prog-title').textContent = 'Starting pipeline…';
+  document.getElementById('prog-sub').textContent   = '';
+
+  ['stage-hashtag','stage-profiles','stage-filter','stage-gemini'].forEach(s =>
+    document.getElementById(s).className = 'stage-pill');
+  setStageActive('stage-hashtag');
+  initTagChips(hashtags);
+
+  addLog(`Niche: "${niche}"  |  ${hashtags.length} hashtag(s)  |  geo: ${geo_filter||'any'}  |  followers: ${min_followers.toLocaleString()}–${max_followers.toLocaleString()}`, 'info');
+
+  fetch('/scan', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({hashtags:hashtagRaw, niche, geo_filter, limit, debug_mode,
+                          search_keywords:search_kw, min_followers, max_followers})
+  }).then(resp => {
+    reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    function read() {
+      if (stopFlag) { reader.cancel(); finishScan(); return; }
+      reader.read().then(({done, value}) => {
+        if (done) { finishScan(); return; }
+        buf += decoder.decode(value, {stream:true});
+        const lines = buf.split('\n'); buf = lines.pop();
+        lines.forEach(line => {
+          if (!line.startsWith('data: ')) return;
+          try { handleMsg(JSON.parse(line.slice(6))); } catch {}
+        });
+        read();
+      }).catch(err => { if (!stopFlag) addLog('Stream error: '+err.message,'warn'); finishScan(); });
+    }
+    read();
+  }).catch(err => { showError('Network error: '+err.message); finishScan(); });
+}
+
+function stopScan() {
+  stopFlag = true; if (reader) reader.cancel();
+  addLog('Scan stopped by user.','warn'); finishScan();
+}
+
+// ── Message handler ───────────────────────────────────────────────────────────
+function handleMsg(msg) {
+  const t = msg.type;
+  if      (t === 'progress')     handleProgress(msg);
+  else if (t === 'tier_summary') handleTierSummary(msg);
+  else if (t === 'tier_header')  { /* handled inline in renderTable */ }
+  else if (t === 'profile')      handleProfile(msg);
+  else if (t === 'skipped')      handleSkipped(msg);
+  else if (t === 'error')        { showError(msg.message); finishScan(); }
+  else if (t === 'done')         handleDone(msg);
+}
+
+function handleProgress(msg) {
+  const stage = msg.stage;
+  if (stage === 'hashtag_scan') {
+    setStageActive('stage-hashtag');
+    document.getElementById('prog-title').textContent =
+      `Scanning hashtags… (${(msg.done_tags||[]).length} / ${msg.total_tags||'?'} done)`;
+    if (msg.total_users !== undefined)
+      document.getElementById('prog-sub').textContent = `${msg.total_users} unique accounts`;
+    if (msg.done_tags && msg.done_tags.length) {
+      const last = msg.done_tags[msg.done_tags.length-1];
+      markTagDone(last, '');
+      addLog(msg.detail || `#${last} done`, 'ok');
+    }
+  } else if (stage === 'profiles') {
+    setStagesDone('stage-hashtag'); setStageActive('stage-profiles');
+    document.getElementById('prog-title').textContent =
+      msg.fetched !== undefined ? `Fetching profiles… ${msg.fetched} / ${msg.total}` : msg.detail;
+    if (msg.fetched && msg.total)
+      document.getElementById('prog-sub').textContent = Math.round(msg.fetched/msg.total*100)+'% complete';
+    addLog(msg.detail, 'info');
+  } else if (stage === 'filtering') {
+    setStagesDone('stage-hashtag','stage-profiles'); setStageActive('stage-filter');
+    document.getElementById('prog-title').textContent = msg.detail;
+    addLog(msg.detail, 'info');
+  } else if (stage === 'gemini') {
+    setStagesDone('stage-hashtag','stage-profiles','stage-filter'); setStageActive('stage-gemini');
+    document.getElementById('prog-title').textContent = 'Gemini AI validation in progress…';
+    document.getElementById('progbar-wrap').style.display = '';
+    document.getElementById('gemini-total').textContent = msg.total_candidates || '?';
+    addLog(msg.detail, 'gemini');
+    if (msg.validated !== undefined && msg.total_candidates) {
+      const pct = Math.round(msg.validated/msg.total_candidates*100);
+      document.getElementById('prog-bar').style.width = pct+'%';
+      document.getElementById('gemini-done').textContent = msg.validated;
+      document.getElementById('gemini-prog-text').textContent = `Validating… ${pct}%`;
+    }
+  }
+}
+
+function handleTierSummary(msg) {
+  const counts = msg.counts || {};
+  addLog(`Scored ${msg.total} profiles — 🔥${counts['1']||0} hot / ⚡${counts['2']||0} partial / 🔍${counts['3']||0} weak / ⬇${counts['4']||0} out-of-range`, 'gemini');
+}
+
+function handleProfile(msg) {
+  allProfiles.push({tier: msg.tier, row_n: msg.row_n, profile: msg.profile});
+  updateTabCounts();
+  // Show filter bar once we have data
+  document.getElementById('filter-bar').classList.add('visible');
+  // Incrementally append to table (only if this tier is visible under current filter)
+  if (activeFilter === 0 || activeFilter === msg.tier) {
+    document.getElementById('table-wrap').style.display = '';
+    document.getElementById('empty-state').style.display = 'none';
+    // Re-render fully so tier headers stay correct
+    renderTable();
+  }
+  const p = msg.profile;
+  if (msg.tier === 1 && p.gemini_valid)
+    addLog(`✓ Hot lead: ${p.page_name} — ${p.business_category}${p.city?' · '+p.city:''} [${p.confidence}]`, 'ok');
+}
+
+function handleSkipped(msg) {
+  skippedN++;
+  addLog(`✗ ${msg.reason||'rejected'}`, 'skip');
+}
+
+function handleDone(msg) {
+  addLog(`✓ Done — ${msg.total_profiles} profiles across all tiers, ${msg.total} hot leads confirmed`, 'ok');
+  document.getElementById('prog-title').textContent = `Scan complete — ${msg.total_profiles} profiles found`;
+  document.getElementById('prog-sub').textContent   = `${msg.total} hot leads`;
+  document.getElementById('main-spinner').style.display = 'none';
+  setStagesDone('stage-hashtag','stage-profiles','stage-filter','stage-gemini');
+  finishScan();
+}
+
+function finishScan() {
+  scanning = false;
+  document.getElementById('btn-scan').style.display = '';
+  document.getElementById('btn-stop').style.display = 'none';
+  document.getElementById('btn-export').disabled = allProfiles.length === 0;
+  document.getElementById('main-spinner').style.display = 'none';
+  if (!allProfiles.length && !document.getElementById('error-box').classList.contains('visible'))
+    document.getElementById('empty-state').style.display = '';
+}
+
+// ── CSV export ────────────────────────────────────────────────────────────────
+function exportCsv() {
+  const toExport = allProfiles.map(item => ({...item.profile, tier: item.tier}));
+  fetch('/export', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(toExport)})
+    .then(r => r.blob()).then(blob => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = `wa_leads_${Date.now()}.csv`; a.click();
+    });
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function showError(msg) {
+  const box = document.getElementById('error-box');
+  box.textContent = '⚠  '+msg; box.classList.add('visible');
+  document.getElementById('main-spinner').style.display = 'none';
+  document.getElementById('prog-title').textContent = 'Error';
+}
+
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function fmtNum(n) {
+  if (!n) return '—';
+  if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1)+'K';
+  return String(n);
+}
+
+// Auto-suggest hashtags when niche changes
+document.getElementById('niche').addEventListener('change', function() {
+  const niche = this.value.toLowerCase();
+  const tagEl = document.getElementById('hashtags');
+  if (tagEl.value.trim()) return;
+  const suggestions = {
+    'sweet':    'hyderabadsweets, telugusweets, andhrasweets, homemadesweets, mithai, traditionalsweets',
+    'pickle':   'andhrapickles, teluguachaar, homemadepickles, avakaya, gongura, pachadi',
+    'food':     'hyderabadfood, homemadefood, tiffinservice, homemadesnacks, telugurecipes',
+    'jewellery':'hyderabadjewellery, teluguimitation, artificialjewellery, templejewellery',
+    'clothing': 'hyderabadboutique, telanganaboutique, handlooms, ethnicwear, sareesonline',
+    'beauty':   'hyderabadskincare, naturalskincare, organicbeauty, handmadesoap',
+    'plant':    'hyderabadplants, indoorplants, succulents, terracegarden',
+  };
+  for (const [key, tags] of Object.entries(suggestions)) {
+    if (niche.includes(key)) { tagEl.value = tags; break; }
+  }
+});
+</script>
+</body>
+</html>
