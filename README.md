@@ -1,27 +1,36 @@
-# WA Lead Finder — instagrapi edition
+# WA Lead Finder — CRM Edition
 
-Zero Apify cost. Uses Instagram's private API directly via `instagrapi`.
+Instagram lead finder for WhatsApp businesses, with built-in CRM and outreach tracking.
+
+## Features
+
+- **12 pre-configured business niches** (sweets, fish export, travel agents, etc.)
+- **Scan tab** — find Instagram accounts by hashtag/keyword, auto-scored into tiers
+- **CRM tab** — all hot leads auto-saved; track outreach status per lead
+- **Stats tab** — pipeline overview (contacted, responded, response rate, closed deals)
+- Gemini 2.5 Flash AI validation on hot leads
 
 ## Project structure
 
 ```
-main.py             ← Flask app (drop-in replacement for Apify version)
-requirements.txt
-Procfile            ← for Railway / gunicorn
-railway.toml
+main.py             ← Flask app (scan + CRM API)
 templates/
-  index.html        ← frontend (unchanged from original)
-static/             ← any static assets
-.env.example        ← copy to .env for local dev
+  index.html        ← 3-tab frontend (Scan / CRM / Stats)
+requirements.txt
+Procfile
+railway.toml
+.env.example
+crm.db              ← SQLite CRM (auto-created on first run, persists locally)
 ```
 
 ## Local setup
 
 ```bash
 pip install -r requirements.txt
+playwright install chromium
 
 cp .env.example .env
-# fill in IG_USERNAME, IG_PASSWORD, GEMINI_API_KEY
+# fill in GEMINI_API_KEY
 
 python main.py
 # → http://localhost:5000
@@ -31,30 +40,38 @@ python main.py
 
 1. Push this repo to GitHub
 2. New project → Deploy from GitHub repo
-3. Add environment variables in Railway dashboard:
-   - `IG_USERNAME`
-   - `IG_PASSWORD`
+3. Add environment variables:
    - `GEMINI_API_KEY`
-4. Railway auto-detects `Procfile` and deploys
+   - `DB_PATH=/data/crm.db`  ← use Railway volume for persistence
+4. Add a Railway Volume mounted at `/data`
 
-## Important notes
+## Outreach workflow
 
-### Rate limits
-- `instagrapi` adds 0.8–1.8s delay between profile fetches automatically
-- Don't run more than 1 scan at a time
-- Hashtag scraping fetches ~30–80 posts per tag by default
-- For 50 leads target: expect ~5–10 min run time
+1. **Scan** → pick a category → Start Scan
+2. Hot leads (Tier 1, AI-validated) are **auto-saved** to the CRM
+3. Go to **CRM tab** → open a lead → click **Update**
+4. Set status: Contacted → Followed Up → Responded → Closed
+5. Click the 💬 WA button to open WhatsApp directly
+6. Use **Stats tab** to monitor conversion funnel
 
-### Session persistence
-On first run the app logs in and saves `ig_session.json`.
-On Railway, the filesystem resets each deploy — the app just re-logs in automatically.
-If you get login challenges, delete `ig_session.json` and restart.
+## Business categories built-in
 
-### If Instagram blocks the account
-- Use a throwaway account (not your main)
-- Don't run scans too frequently (max 2–3/day)
-- If challenged, the app logs the error — create a fresh throwaway
+1. Sweets & Pickles
+2. Aquaculture & Sea Fish Export
+3. Travel Agents
+4. Beauty / Hair / Body Care
+5. Cakes & Dessert Bakers
+6. Personalised Gift Shops
+7. Event Planners & Decorators
+8. Home Interior & Furniture
+9. Homemade Dairy Products
+10. Homemade Cosmetics & Soaps
+11. Therapists & Online Doctors
+12. Gym Trainers, MUA & Dieticians
 
-### Gemini cost
-Still ~$0.00 per run (2.5 Flash is essentially free at this volume).
-The only cost is Railway dyno time (~$5/month on hobby plan).
+## Notes
+
+- On Railway the filesystem resets on redeploy — use a Volume for `DB_PATH`
+- Don't run more than 1 scan at a time; Instagram rate-limits aggressively
+- Use a throwaway Instagram account (the scraper doesn't log in, but IPs can be flagged)
+- Max 2–3 scans/day per IP

@@ -1,4 +1,5 @@
-import os, re, csv, json, logging, requests, time, random, threading, queue
+import os, re, csv, json, logging, requests, time, random, threading, queue, sqlite3
+from contextlib import contextmanager
 from dotenv import load_dotenv
 load_dotenv()
 from io import StringIO
@@ -43,19 +44,141 @@ CITY_PATTERNS = [
     r'(?:ship|deliver|delivery)\s+(?:from|across)\s+([A-Za-z\s]+?)(?:\s*[\|\n|,]|$)',
 ]
 
-# ── Tier definitions ──────────────────────────────────────────────────────────
-#
-#  Tier 1 — Hot leads  : follower range ✓  |  not verified  |  not big brand  |  WA signal ✓  |  geo match ✓
-#  Tier 2 — Partial    : follower range ✓  |  WA signal ✓   |  fails geo  (or geo not set)
-#  Tier 3 — Weak       : follower range ✓  |  no WA signal  |  not verified  |  not big brand
-#  Tier 4 — Out of range: fails follower range  OR  verified  OR  big brand
-
 TIER_LABELS = {
     1: "🔥 Hot Leads — all requirements met",
     2: "⚡ Partial Match — WA signal present, geo missing",
     3: "🔍 Weak Signal — in follower range but no WA",
     4: "⬇ Out of Range — wrong follower count / verified / big brand",
 }
+
+# ── Business niche presets ─────────────────────────────────────────────────────
+NICHE_PRESETS = {
+    "sweets_pickles": {
+        "label": "🍬 Sweets & Pickles",
+        "niche": "homemade sweets, pickles, achaar, mithai, traditional food",
+        "hashtags": "hyderabadsweets,telugusweets,andhrasweets,homemadesweets,mithai,traditionalsweets,andhrapickles,teluguachaar,homemadepickles,avakaya,gongura,pachadi,handmadesweets,desisweets",
+        "geo": "hyderabad,andhra,telangana",
+    },
+    "aquaculture": {
+        "label": "🐟 Aquaculture & Sea Fish Export",
+        "niche": "fish export, seafood, aquaculture, fresh fish delivery, prawns",
+        "hashtags": "seafoodexport,freshfish,aquaculture,fishfarm,prawnexport,hyderabadfishmarket,andhraseafood,vizagfish,seafooddelivery,freshseafood,fishsupplier",
+        "geo": "hyderabad,vizag,kakinada,andhra,telangana",
+    },
+    "travel_agents": {
+        "label": "✈️ Travel Agents",
+        "niche": "travel agent, tour packages, holiday packages, visa, flight booking",
+        "hashtags": "travelagent,tourpackages,holidaypackage,hyderabadtravel,indiatravel,touroperator,visaconsultant,travelbusiness,tourplanner,travelagency",
+        "geo": "hyderabad,telangana,andhra",
+    },
+    "beauty_products": {
+        "label": "💄 Beauty, Hair & Body Care",
+        "niche": "beauty products, hair care, body care, skincare, herbal beauty",
+        "hashtags": "hyderabadskincare,naturalskincare,organicbeauty,handmadesoap,haircare,bodycare,beautyproducts,herbalskincare,naturalbeauty,skincareroutine,hairgrowth,organicskincare",
+        "geo": "hyderabad,telangana,andhra",
+    },
+    "cakes_bakers": {
+        "label": "🎂 Cakes & Dessert Bakers",
+        "niche": "custom cakes, home baker, desserts, cupcakes, birthday cakes",
+        "hashtags": "hyderabadbaker,customcakes,homebaker,cakedesign,birthdaycake,weddingcake,designercakes,fondantcakes,bakery,desserts,cupcakes,hyderabadcakes,chocolatecakes",
+        "geo": "hyderabad,telangana,andhra",
+    },
+    "gift_shops": {
+        "label": "🎁 Personalised Gift Shops",
+        "niche": "personalised gifts, custom gifts, gifting, engraved gifts",
+        "hashtags": "personalisedgifts,customgifts,giftshop,uniquegifts,gifting,customizedgifts,corporategifts,handmadegifts,specialgifts,birthdaygifts,weddingfavors",
+        "geo": "hyderabad,telangana,andhra",
+    },
+    "event_planners": {
+        "label": "🎪 Event Planners & Decorators",
+        "niche": "event planner, wedding decorator, party decoration, event management",
+        "hashtags": "hyderabadevents,eventplanner,weddingdecor,partydecoration,eventmanagement,weddingevents,babyshower,housewarming,birthdayparty,eventdecor,weddingplanner",
+        "geo": "hyderabad,telangana,andhra",
+    },
+    "home_interior": {
+        "label": "🏠 Home Interior & Furniture",
+        "niche": "home interior, furniture design, home decor, interior designer",
+        "hashtags": "hyderabadinterior,homeinterior,furnituredesign,homedecor,interiordesign,homefurnishing,customfurniture,interiordecor,moderninterior,homedesign,officefurniture",
+        "geo": "hyderabad,telangana,andhra",
+    },
+    "dairy_products": {
+        "label": "🥛 Homemade Dairy Products",
+        "niche": "homemade dairy, ghee, paneer, curd, butter, milk products",
+        "hashtags": "homemadeghee,desi ghee,pureghee,homemadepaneer,dairyproducts,freshpaneer,homemadebutter,organicghee,hyderabadfarm,farmproducts,puremilk",
+        "geo": "hyderabad,telangana,andhra",
+    },
+    "homemade_cosmetics": {
+        "label": "🧴 Homemade Cosmetics & Soaps",
+        "niche": "handmade soaps, homemade cosmetics, natural shampoo, herbal products",
+        "hashtags": "handmadesoap,naturalsoap,organicsoap,homemadecosmetics,herbalshampo,naturalshampoo,herbalcosmetics,diybeauty,chemicalfree,naturalproducts,handcraftedsoap",
+        "geo": "hyderabad,telangana,andhra",
+    },
+    "therapists": {
+        "label": "🩺 Therapists & Online Doctors",
+        "niche": "online doctor, therapist, dietician, health consultant, wellness",
+        "hashtags": "onlinedoctor,therapist,mentalhealth,dietician,nutritionist,healthcoach,wellnesscoach,onlineconsultation,psychologist,lifecoach,healthconsultant",
+        "geo": "hyderabad,telangana,andhra,india",
+    },
+    "fitness_trainers": {
+        "label": "💪 Gym Trainers, MUA & Dieticians",
+        "niche": "personal trainer, makeup artist, dietician, fitness coach, gym",
+        "hashtags": "personaltrainer,makeupartist,gymtrainer,fitnesscoach,dietician,nutritionist,mua,makeupindia,hyderabadmakeup,fitnessmotivation,gymmotivation,makeupbride",
+        "geo": "hyderabad,telangana,andhra",
+    },
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SQLite CRM Database
+# ══════════════════════════════════════════════════════════════════════════════
+
+DB_PATH = os.environ.get("DB_PATH", "crm.db")
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS leads (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            username        TEXT UNIQUE NOT NULL,
+            business_name   TEXT,
+            category        TEXT,
+            city            TEXT,
+            whatsapp_number TEXT,
+            followers       INTEGER,
+            bio             TEXT,
+            ig_url          TEXT,
+            website         TEXT,
+            tier            INTEGER,
+            confidence      TEXT,
+            niche_preset    TEXT,
+            added_at        TEXT DEFAULT (datetime('now')),
+            outreach_status TEXT DEFAULT 'not_contacted',
+            outreach_sent_at TEXT,
+            outreach_notes  TEXT,
+            responded       INTEGER DEFAULT 0,
+            responded_at    TEXT,
+            response_notes  TEXT,
+            deal_status     TEXT DEFAULT 'none'
+        );
+
+        CREATE TABLE IF NOT EXISTS outreach_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id     INTEGER REFERENCES leads(id),
+            username    TEXT,
+            action      TEXT,
+            notes       TEXT,
+            created_at  TEXT DEFAULT (datetime('now'))
+        );
+    """)
+    conn.commit()
+    conn.close()
+    log.info("CRM DB initialised at %s", DB_PATH)
+
+init_db()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Playwright worker thread (single thread owns the browser)
@@ -190,21 +313,12 @@ def fetch_bio_link(url: str) -> str:
 
 def score_profile(profile: dict, geo_filter: str, min_followers: int, max_followers: int,
                   extra_text: str = "") -> tuple[int, list[str], list[str]]:
-    """
-    Return (tier, met_signals, missing_signals).
-
-    Tier 1 — meets everything
-    Tier 2 — follower range + WA signal, but geo fails (or no geo set)
-    Tier 3 — follower range only, no WA signal
-    Tier 4 — out of range / verified / big brand
-    """
     bio       = profile.get("bio", "")
     followers = profile.get("followers", 0)
     url       = profile.get("external_url", "")
 
     met, missing = [], []
 
-    # ── Follower range ────────────────────────────────────────────────────────
     in_range  = min_followers <= followers <= max_followers
     verified  = profile.get("is_verified", False)
     big_brand = is_large_brand(bio, followers, max_followers)
@@ -222,14 +336,12 @@ def score_profile(profile: dict, geo_filter: str, min_followers: int, max_follow
     if not in_range or verified or big_brand:
         return 4, met, missing
 
-    # ── WA signal ─────────────────────────────────────────────────────────────
     wa = has_wa_signal(bio, url, extra_text)
     if wa:
         met.append("WhatsApp signal detected")
     else:
         missing.append("No WhatsApp signal")
 
-    # ── Geo filter ────────────────────────────────────────────────────────────
     geo_ok = True
     if geo_filter:
         geo_text = f"{bio} {profile.get('full_name','')} {profile.get('username','')}".lower()
@@ -473,7 +585,8 @@ def build_search_queries(niche: str, geo_filter: str, explicit: list[str]) -> li
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
-                 search_keywords=None, min_followers=MIN_FOLLOWERS, max_followers=MAX_FOLLOWERS):
+                 search_keywords=None, min_followers=MIN_FOLLOWERS, max_followers=MAX_FOLLOWERS,
+                 niche_preset=None):
 
     try:
         _start_browser_thread()
@@ -486,7 +599,6 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
     all_usernames: set[str] = set()
     done_tags = []
 
-    # ── Phase 1a: hashtag scraping ────────────────────────────────────────────
     if hashtags:
         per_tag = max(30, (limit * 8) // max(len(hashtags), 1))
         yield {"type": "progress", "stage": "hashtag_scan",
@@ -504,7 +616,6 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
                    "total_users": len(all_usernames)}
             time.sleep(random.uniform(2, 4))
 
-    # ── Phase 1b: keyword search ──────────────────────────────────────────────
     queries = build_search_queries(niche, geo_filter, search_keywords or [])
     if queries:
         yield {"type": "progress", "stage": "hashtag_scan",
@@ -521,7 +632,6 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
     if not all_usernames:
         yield {"type": "error", "message": "No accounts found. Try different hashtags or keywords."}; return
 
-    # ── Phase 2: fetch full profiles ──────────────────────────────────────────
     yield {"type": "progress", "stage": "profiles",
            "detail": f"Fetching full profiles for {len(all_usernames)} accounts…"}
 
@@ -544,7 +654,6 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
         yield {"type": "error", "message": "Profile fetch returned no data. Instagram may be throttling — try again in a few minutes."}
         return
 
-    # ── Phase 3: score & tier every profile ───────────────────────────────────
     yield {"type": "progress", "stage": "filtering",
            "detail": f"Scoring and tiering {len(all_profiles)} profiles…"}
 
@@ -560,12 +669,10 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
         tier, met, missing = score_profile(profile, geo_filter, min_followers, max_followers, extra_text)
         tiered[tier].append((profile, extra_text, met, missing))
 
-    # Emit tier counts summary
     yield {"type": "tier_summary",
            "counts": {str(t): len(v) for t, v in tiered.items()},
            "total": len(all_profiles)}
 
-    # ── Phase 4: Gemini validate tier-1 (and tier-2 in debug mode) ───────────
     hot_candidates = tiered[1] if not debug_mode else tiered[1] + tiered[2]
 
     yield {"type": "progress", "stage": "gemini",
@@ -574,7 +681,7 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
 
     exported  = 0
     validated = 0
-    gemini_results: dict[str, dict] = {}   # username → gem result
+    gemini_results: dict[str, dict] = {}
 
     def validate_one(args):
         profile, extra_text, met, missing = args
@@ -593,11 +700,10 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
             username  = profile["username"]
             gemini_results[username] = gem
 
-            yield {"type": "progress", "stage": "gemini",   # keep progress bar moving
+            yield {"type": "progress", "stage": "gemini",
                    "detail": f"Validated {validated}/{len(hot_candidates)}",
                    "validated": validated, "total_candidates": len(hot_candidates)}
 
-    # ── Phase 5: emit all profiles grouped by tier ────────────────────────────
     row_n = 0
     for tier in [1, 2, 3, 4]:
         if not tiered[tier]:
@@ -619,30 +725,50 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
             confidence = gem.get("confidence", "—") if gem else "—"
             gemini_valid = gem.get("valid", None) if gem else None
 
+            profile_data = {
+                "business_name":     profile.get("full_name") or username,
+                "page_name":         f"@{username}",
+                "business_category": category,
+                "city":              city,
+                "whatsapp_number":   wa_number,
+                "confidence":        confidence,
+                "gemini_valid":      gemini_valid,
+                "followers":         profile.get("followers", 0),
+                "following":         profile.get("following", 0),
+                "total_posts":       profile.get("post_count", 0),
+                "is_business_acct":  "Yes" if profile.get("is_business") else "No",
+                "bio":               bio[:250],
+                "website":           url,
+                "ig_url":            f"https://instagram.com/{username}",
+                "gemini_reason":     gem.get("reason", ""),
+                "met":               met,
+                "missing":           missing,
+                "scraped_at":        datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+                "niche_preset":      niche_preset or "",
+            }
+
+            # Auto-save tier-1 validated leads to CRM
+            if tier == 1 and gemini_valid:
+                try:
+                    conn = get_db()
+                    conn.execute("""
+                        INSERT OR IGNORE INTO leads
+                          (username, business_name, category, city, whatsapp_number,
+                           followers, bio, ig_url, website, tier, confidence, niche_preset)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (username, profile_data["business_name"], category, city, wa_number,
+                          profile.get("followers", 0), bio[:500], f"https://instagram.com/{username}",
+                          url, tier, confidence, niche_preset or ""))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    log.warning(f"CRM save failed for @{username}: {e}")
+
             yield {
                 "type":     "profile",
                 "tier":     tier,
                 "row_n":    row_n,
-                "profile": {
-                    "business_name":     profile.get("full_name") or username,
-                    "page_name":         f"@{username}",
-                    "business_category": category,
-                    "city":              city,
-                    "whatsapp_number":   wa_number,
-                    "confidence":        confidence,
-                    "gemini_valid":      gemini_valid,
-                    "followers":         profile.get("followers", 0),
-                    "following":         profile.get("following", 0),
-                    "total_posts":       profile.get("post_count", 0),
-                    "is_business_acct":  "Yes" if profile.get("is_business") else "No",
-                    "bio":               bio[:250],
-                    "website":           url,
-                    "ig_url":            f"https://instagram.com/{username}",
-                    "gemini_reason":     gem.get("reason", ""),
-                    "met":               met,
-                    "missing":           missing,
-                    "scraped_at":        datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
-                }
+                "profile":  profile_data,
             }
 
             if tier == 1 and gemini_valid:
@@ -653,12 +779,16 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Routes
+# Routes — Scan
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/")
 def index():
     return render_template("index.html")
+
+@app.route("/niche_presets")
+def niche_presets():
+    return jsonify(NICHE_PRESETS)
 
 @app.route("/scan", methods=["POST"])
 def scan():
@@ -673,10 +803,11 @@ def scan():
     min_followers   = max(0, int(data.get("min_followers", MIN_FOLLOWERS)))
     max_followers   = max(min_followers, int(data.get("max_followers", MAX_FOLLOWERS)))
     hashtags        = [t.strip().lstrip("#") for t in raw_tags.split(",") if t.strip()]
+    niche_preset    = data.get("niche_preset", "")
 
     def generate():
         for item in run_pipeline(hashtags, niche, geo_filter, limit, debug_mode,
-                                 search_keywords, min_followers, max_followers):
+                                 search_keywords, min_followers, max_followers, niche_preset):
             yield f"data: {json.dumps(item)}\n\n"
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream",
@@ -703,6 +834,146 @@ def export_csv():
     fname = f"wa_leads_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
     return Response(si.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Routes — CRM
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/crm/leads")
+def crm_leads():
+    status   = request.args.get("status", "")
+    preset   = request.args.get("preset", "")
+    search   = request.args.get("q", "")
+    page     = max(1, int(request.args.get("page", 1)))
+    per_page = 50
+
+    conn  = get_db()
+    where = ["1=1"]
+    params = []
+    if status:
+        where.append("outreach_status = ?"); params.append(status)
+    if preset:
+        where.append("niche_preset = ?"); params.append(preset)
+    if search:
+        where.append("(username LIKE ? OR business_name LIKE ? OR city LIKE ? OR whatsapp_number LIKE ?)")
+        params += [f"%{search}%"]*4
+
+    clause = " AND ".join(where)
+    total  = conn.execute(f"SELECT COUNT(*) FROM leads WHERE {clause}", params).fetchone()[0]
+    rows   = conn.execute(
+        f"SELECT * FROM leads WHERE {clause} ORDER BY added_at DESC LIMIT ? OFFSET ?",
+        params + [per_page, (page-1)*per_page]
+    ).fetchall()
+
+    # Status counts
+    status_counts = {r["outreach_status"]: r["cnt"] for r in
+                     conn.execute("SELECT outreach_status, COUNT(*) as cnt FROM leads GROUP BY outreach_status").fetchall()}
+    conn.close()
+
+    return jsonify({
+        "leads": [dict(r) for r in rows],
+        "total": total,
+        "page":  page,
+        "pages": (total + per_page - 1) // per_page,
+        "status_counts": status_counts,
+    })
+
+
+@app.route("/crm/leads/<int:lead_id>", methods=["PATCH"])
+def crm_update_lead(lead_id):
+    data   = request.json or {}
+    fields = {}
+    allowed = ["outreach_status","outreach_notes","response_notes","deal_status","responded"]
+    for k in allowed:
+        if k in data:
+            fields[k] = data[k]
+
+    if "outreach_status" in fields and fields["outreach_status"] != "not_contacted":
+        fields["outreach_sent_at"] = datetime.utcnow().isoformat()
+    if "responded" in fields and fields["responded"]:
+        fields["responded_at"] = datetime.utcnow().isoformat()
+
+    if not fields:
+        return jsonify({"error": "Nothing to update"}), 400
+
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    vals       = list(fields.values()) + [lead_id]
+    conn = get_db()
+    conn.execute(f"UPDATE leads SET {set_clause} WHERE id=?", vals)
+
+    # Log the action
+    action = data.get("outreach_status") or ("responded" if "responded" in data else "updated")
+    notes  = data.get("outreach_notes") or data.get("response_notes") or ""
+    username = conn.execute("SELECT username FROM leads WHERE id=?", [lead_id]).fetchone()
+    uname = username["username"] if username else ""
+    conn.execute("INSERT INTO outreach_log (lead_id, username, action, notes) VALUES (?,?,?,?)",
+                 [lead_id, uname, action, notes])
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/crm/leads/bulk", methods=["POST"])
+def crm_bulk_update():
+    """Bulk mark leads as contacted"""
+    data    = request.json or {}
+    ids     = data.get("ids", [])
+    status  = data.get("status", "contacted")
+    notes   = data.get("notes", "")
+    if not ids:
+        return jsonify({"error": "No IDs"}), 400
+
+    conn = get_db()
+    placeholders = ",".join("?" * len(ids))
+    conn.execute(
+        f"UPDATE leads SET outreach_status=?, outreach_notes=?, outreach_sent_at=? WHERE id IN ({placeholders})",
+        [status, notes, datetime.utcnow().isoformat()] + ids
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "updated": len(ids)})
+
+
+@app.route("/crm/stats")
+def crm_stats():
+    conn = get_db()
+    total        = conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+    by_status    = {r["outreach_status"]: r["cnt"] for r in
+                    conn.execute("SELECT outreach_status, COUNT(*) as cnt FROM leads GROUP BY outreach_status").fetchall()}
+    by_preset    = {r["niche_preset"]: r["cnt"] for r in
+                    conn.execute("SELECT niche_preset, COUNT(*) as cnt FROM leads GROUP BY niche_preset").fetchall()}
+    responded    = conn.execute("SELECT COUNT(*) FROM leads WHERE responded=1").fetchone()[0]
+    deals        = conn.execute("SELECT COUNT(*) FROM leads WHERE deal_status='closed'").fetchone()[0]
+    conn.close()
+    return jsonify({"total": total, "by_status": by_status, "by_preset": by_preset,
+                    "responded": responded, "deals": deals})
+
+
+@app.route("/crm/export")
+def crm_export():
+    conn  = get_db()
+    rows  = conn.execute("SELECT * FROM leads ORDER BY added_at DESC").fetchall()
+    conn.close()
+
+    si     = StringIO()
+    fields = ["id","username","business_name","category","city","whatsapp_number","followers",
+              "ig_url","tier","confidence","niche_preset","added_at",
+              "outreach_status","outreach_sent_at","outreach_notes",
+              "responded","responded_at","response_notes","deal_status"]
+    writer = csv.DictWriter(si, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(dict(row))
+
+    fname = f"crm_leads_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    return Response(si.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Misc routes
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/ig_challenge", methods=["POST"])
 def ig_challenge():
