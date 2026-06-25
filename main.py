@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from dotenv import load_dotenv
 load_dotenv()
 from io import StringIO
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 
@@ -146,7 +146,9 @@ def init_db():
             username        TEXT UNIQUE NOT NULL,
             business_name   TEXT,
             category        TEXT,
+            business_type   TEXT,
             city            TEXT,
+            state           TEXT,
             whatsapp_number TEXT,
             followers       INTEGER,
             bio             TEXT,
@@ -155,6 +157,11 @@ def init_db():
             tier            INTEGER,
             confidence      TEXT,
             niche_preset    TEXT,
+            sells_on_whatsapp INTEGER DEFAULT 0,
+            ordering_method TEXT,
+            products_services TEXT,
+            languages       TEXT,
+            gemini_reason   TEXT,
             added_at        TEXT DEFAULT (datetime('now')),
             outreach_status TEXT DEFAULT 'not_contacted',
             outreach_sent_at TEXT,
@@ -173,7 +180,26 @@ def init_db():
             notes       TEXT,
             created_at  TEXT DEFAULT (datetime('now'))
         );
+
+        -- Add new columns if upgrading from older schema
+        CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(outreach_status);
+        CREATE INDEX IF NOT EXISTS idx_leads_preset ON leads(niche_preset);
     """)
+    # Migrate: add missing columns to existing DB without breaking it
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(leads)").fetchall()}
+    new_cols = {
+        "business_type":    "TEXT",
+        "state":            "TEXT",
+        "sells_on_whatsapp":"INTEGER DEFAULT 0",
+        "ordering_method":  "TEXT",
+        "products_services":"TEXT",
+        "languages":        "TEXT",
+        "gemini_reason":    "TEXT",
+    }
+    for col, typedef in new_cols.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE leads ADD COLUMN {col} {typedef}")
+            log.info(f"DB migration: added column leads.{col}")
     conn.commit()
     conn.close()
     log.info("CRM DB initialised at %s", DB_PATH)
@@ -361,68 +387,142 @@ def score_profile(profile: dict, geo_filter: str, min_followers: int, max_follow
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Gemini validation
+# Gemini — full profile parse + qualification (runs on every profile)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def gemini_validate(profile: dict, niche: str, extra_text: str = "") -> dict:
+_GEMINI_EMPTY = {
+    "valid": False,
+    "confidence": "low",
+    "city": "",
+    "state": "",
+    "country": "India",
+    "whatsapp_number": "",
+    "whatsapp_signal": False,
+    "category": "",
+    "business_type": "",
+    "sells_on_whatsapp": False,
+    "is_small_business": True,
+    "is_large_brand": False,
+    "is_influencer": False,
+    "ordering_method": "",
+    "products_or_services": "",
+    "languages": "",
+    "reason": "Gemini not configured",
+    "gemini_ran": False,
+}
+
+def gemini_parse_profile(profile: dict, niche: str, extra_text: str = "") -> dict:
+    """
+    Single Gemini call per profile that does everything:
+      - Data extraction: city, state, phone/WA number, products, ordering method, languages
+      - Classification: business type, category, is_influencer, is_large_brand
+      - Qualification: sells on WA, niche match, confidence, validity
+    Returns a rich dict. Falls back gracefully if no API key or on error.
+    """
     if not GEMINI_KEY:
-        return {"valid": True, "confidence": "medium", "city": "", "reason": "No Gemini key", "category": ""}
+        return {**_GEMINI_EMPTY, "reason": "No Gemini API key configured", "gemini_ran": False}
 
-    bio       = profile.get("bio", "")
-    full_name = profile.get("full_name", "")
     username  = profile.get("username", "")
+    full_name = profile.get("full_name", "")
     followers = profile.get("followers", 0)
+    following = profile.get("following", 0)
+    bio       = profile.get("bio", "")
     url       = profile.get("external_url", "")
+    ig_cat    = profile.get("ig_category", "")
+    is_biz    = profile.get("is_business", False)
+    post_cnt  = profile.get("post_count", 0)
 
-    prompt = f"""You are a lead qualification AI for a WhatsApp outreach tool.
+    prompt = f"""You are a data extraction and lead qualification AI for a WhatsApp business outreach tool targeting small Indian businesses.
 
-Analyze this Instagram profile and determine if it's a genuine small business that:
-1. Sells products/services primarily through WhatsApp (not a proper e-commerce website)
-2. Is relevant to the niche: "{niche}"
-3. Is a real small/micro business (not a large brand, reseller aggregator, or influencer)
+Your job is to FULLY parse this Instagram profile and return a structured JSON object with every field filled as accurately as possible.
 
-Profile:
-- Username: @{username}
-- Name: {full_name}
-- Followers: {followers:,}
-- Bio: {bio}
-- External URL: {url}
-- Bio link page content (if any): {extra_text[:500] if extra_text else 'None'}
+=== PROFILE DATA ===
+Username:       @{username}
+Display name:   {full_name}
+Followers:      {followers:,}
+Following:      {following:,}
+Posts:          {post_cnt}
+IG Category:    {ig_cat or 'not set'}
+Is Business:    {is_biz}
+Bio:
+{bio}
 
-Respond ONLY in this exact JSON format (no markdown, no explanation):
+External URL:   {url or 'none'}
+Bio-link page content (if bio links to linktree/beacons/etc):
+{extra_text[:800] if extra_text else 'none'}
+
+=== TARGET NICHE ===
+{niche}
+
+=== INSTRUCTIONS ===
+Return ONLY a valid JSON object with exactly these fields (no markdown, no extra text):
+
 {{
-  "valid": true/false,
-  "confidence": "high"/"medium"/"low",
-  "city": "extracted city name or empty string",
-  "category": "detected business category (e.g. Food & Sweets, Clothing, Jewellery, etc.)",
-  "reason": "one sentence explaining your decision"
+  "valid": <true if this is a genuine lead for the niche, false otherwise>,
+  "confidence": <"high" | "medium" | "low">,
+
+  "city": "<city extracted from bio/name/url — just the city name, e.g. Hyderabad>",
+  "state": "<Indian state, e.g. Telangana, Andhra Pradesh — infer from city if not explicit>",
+  "country": "<country, default India>",
+
+  "whatsapp_number": "<full phone number with country code if found, e.g. +919876543210 — check bio, wa.me links, bio-link page. Empty string if not found>",
+  "whatsapp_signal": <true if any WhatsApp contact signal found — number, wa.me link, 'order on WA', 'DM to order', etc.>,
+
+  "category": "<specific business category, e.g. Homemade Sweets, Fish Export, Travel Agent, Beauty Products, Custom Cakes, Gift Shop, Event Decorator, Interior Designer, Dairy Products, Handmade Soaps, Online Therapist, Personal Trainer>",
+  "business_type": "<one of: product_seller | service_provider | both | influencer | brand | unknown>",
+
+  "sells_on_whatsapp": <true if they primarily take orders or inquiries via WhatsApp>,
+  "is_small_business": <true if this is a small/micro business run by an individual or small team>,
+  "is_large_brand": <true if this appears to be a large brand, chain, franchise, or corporate>,
+  "is_influencer": <true if this is primarily a content creator / influencer with no clear product/service>,
+
+  "ordering_method": "<how customers order — e.g. WhatsApp, DM, website, phone, in-store, unknown>",
+  "products_or_services": "<brief comma-separated list of what they sell, e.g. 'avakaya pickle, gongura pickle, homemade chutneys'>",
+  "languages": "<detected language(s) in bio, e.g. English, Telugu, Hindi>",
+
+  "reason": "<one clear sentence explaining why valid is true or false>"
 }}
 
-Rules:
-- valid=true only if it matches the niche AND shows WhatsApp ordering signals
-- high confidence = clear WA number/link + niche match
-- medium = some WA signals + probable niche match
-- low = weak signals but possible
-- city = extract from bio/name if mentioned (city name only, not full address)
-- If not relevant to niche "{niche}", set valid=false"""
+=== EXTRACTION RULES ===
+- whatsapp_number: scan the ENTIRE bio and bio-link content for wa.me/XXXXXXXXXX links or Indian mobile numbers (10 digits starting with 6-9, or with +91 prefix). Format as +91XXXXXXXXXX.
+- city: look for 📍 pin emoji, "based in", "located in", city names, area names. Indian cities only.
+- state: infer from city (e.g. Hyderabad → Telangana, Chennai → Tamil Nadu, Mumbai → Maharashtra).
+- is_influencer: true ONLY if they have no product/service to sell — pure content, reels, memes, fashion blogging with no own product.
+- is_large_brand: true if followers > 200000 OR bio contains corporate signals (pvt ltd, llp, franchise, pan india, official page).
+- valid: true ONLY if (a) niche matches AND (b) whatsapp_signal is true AND (c) is_small_business is true AND (d) NOT is_influencer.
+- confidence: high = WA number found + clear niche match; medium = WA signal (no number) + probable match; low = weak signals."""
 
     try:
         resp = requests.post(
-            GEMINI_URL, params={"key": GEMINI_KEY},
+            GEMINI_URL,
+            params={"key": GEMINI_KEY},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 200, "responseMimeType": "application/json"}
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": 400,
+                    "responseMimeType": "application/json",
+                },
             },
-            timeout=15
+            timeout=20,
         )
         resp.raise_for_status()
-        data = resp.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        text = re.sub(r"^```json\s*", "", text); text = re.sub(r"\s*```$", "", text)
-        return json.loads(text)
+        raw  = resp.json()
+        text = raw["candidates"][0]["content"]["parts"][0]["text"].strip()
+        text = re.sub(r"^```json\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        parsed = json.loads(text)
+        parsed["gemini_ran"] = True
+        # Normalise types in case Gemini returns strings for bools
+        for bfield in ("valid","whatsapp_signal","sells_on_whatsapp","is_small_business",
+                       "is_large_brand","is_influencer"):
+            if bfield in parsed and isinstance(parsed[bfield], str):
+                parsed[bfield] = parsed[bfield].lower() == "true"
+        log.info(f"Gemini @{username}: valid={parsed.get('valid')} conf={parsed.get('confidence')} wa={parsed.get('whatsapp_number') or 'none'} city={parsed.get('city') or 'none'}")
+        return parsed
     except Exception as e:
         log.warning(f"Gemini failed for @{username}: {e}")
-        return {"valid": True, "confidence": "low", "city": "", "reason": f"Gemini error: {e}", "category": ""}
+        return {**_GEMINI_EMPTY, "reason": f"Gemini error: {e}", "gemini_ran": False}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -511,59 +611,192 @@ def collect_usernames_from_search(query: str, limit: int) -> set[str]:
         return set()
 
 
+def _normalise_user(user: dict, username: str) -> dict | None:
+    """Convert any raw Instagram user blob into our standard profile dict."""
+    if not user:
+        return None
+    followers  = (user.get("edge_followed_by", {}).get("count")
+                  or user.get("follower_count")
+                  or user.get("followers_count", 0))
+    following  = (user.get("edge_follow", {}).get("count")
+                  or user.get("following_count", 0))
+    post_count = (user.get("edge_owner_to_timeline_media", {}).get("count")
+                  or user.get("media_count", 0))
+    bio        = user.get("biography") or user.get("bio", "") or ""
+    return {
+        "username":     user.get("username", username),
+        "full_name":    user.get("full_name", ""),
+        "followers":    int(followers or 0),
+        "following":    int(following or 0),
+        "post_count":   int(post_count or 0),
+        "bio":          bio,
+        "external_url": user.get("external_url", "") or "",
+        "is_verified":  bool(user.get("is_verified", False)),
+        "is_business":  bool(user.get("is_business_account", False)
+                             or user.get("is_professional_account", False)),
+        "ig_category":  user.get("category_name", "") or user.get("category", "") or "",
+    }
+
+
+def _extract_user_from_html(content: str, username: str) -> dict | None:
+    """
+    Multi-pattern HTML extraction — tries every known Instagram embedding format.
+    Instagram embeds profile data in several ways; we try them all.
+    """
+    # Strategy 1: window.__additionalDataLoaded or window._sharedData
+    for pat in [
+        r'window\.__additionalDataLoaded\s*\(\s*[\'"][^\'"]*[\'"]\s*,\s*(\{.*?\})\s*\)',
+        r'window\._sharedData\s*=\s*(\{.*?\})\s*;',
+        r'<script type="application/json" data-sj>(\{.*?\})</script>',
+        r'<script type="application/json" data-content-type="media-symbol[^"]*">(\{.*?\})</script>',
+    ]:
+        for m in re.finditer(pat, content, re.S):
+            try:
+                blob = json.loads(m.group(1))
+                # Navigate to user inside sharedData
+                user = (blob.get("entry_data", {}).get("ProfilePage", [{}])[0]
+                            .get("graphql", {}).get("user")
+                        or blob.get("graphql", {}).get("user")
+                        or blob.get("data", {}).get("user")
+                        or blob.get("user"))
+                if user and user.get("biography") is not None:
+                    return _normalise_user(user, username)
+            except Exception:
+                pass
+
+    # Strategy 2: bare JSON blobs containing biography (what the old code did, but broader regex)
+    for m in re.finditer(r'(\{"[^"]*biography[^"]*".*?\})', content, re.S):
+        try:
+            d = json.loads(m.group(1))
+            if d.get("username") and d.get("biography") is not None:
+                return _normalise_user(d, username)
+        except Exception:
+            pass
+
+    # Strategy 3: JSON-LD (some profile pages emit schema.org Person/ProfilePage)
+    for m in re.finditer(r'<script type="application/ld\+json">(.*?)</script>', content, re.S):
+        try:
+            ld = json.loads(m.group(1))
+            if isinstance(ld, list):
+                ld = ld[0]
+            if ld.get("@type") in ("Person", "ProfilePage"):
+                # Map schema.org → our format
+                return {
+                    "username":     username,
+                    "full_name":    ld.get("name", ""),
+                    "followers":    0,
+                    "following":    0,
+                    "post_count":   0,
+                    "bio":          ld.get("description", ""),
+                    "external_url": ld.get("url", ""),
+                    "is_verified":  False,
+                    "is_business":  False,
+                    "ig_category":  "",
+                }
+        except Exception:
+            pass
+
+    # Strategy 4: scrape meta tags as last resort (gives name + description only)
+    name_m = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', content)
+    desc_m = re.search(r'<meta\s+(?:name="description"|property="og:description")\s+content="([^"]+)"', content)
+    if name_m and desc_m:
+        desc = desc_m.group(1)
+        # Instagram description format: "Xk Followers, Y Following, Z Posts - Bio"
+        foll_m = re.search(r'([\d,.]+[kKmM]?)\s+Followers', desc, re.I)
+        foll = 0
+        if foll_m:
+            raw = foll_m.group(1).replace(",", "")
+            try:
+                if raw[-1].lower() == 'k': foll = int(float(raw[:-1]) * 1000)
+                elif raw[-1].lower() == 'm': foll = int(float(raw[:-1]) * 1_000_000)
+                else: foll = int(raw)
+            except Exception: pass
+        bio_part = re.sub(r'^.*?Posts\s*[-–]\s*', '', desc, flags=re.S).strip()
+        log.info(f"@{username}: meta-tag fallback — {foll:,} followers")
+        return {
+            "username":     username,
+            "full_name":    name_m.group(1).split(" (@")[0].strip(),
+            "followers":    foll,
+            "following":    0,
+            "post_count":   0,
+            "bio":          bio_part[:500],
+            "external_url": "",
+            "is_verified":  False,
+            "is_business":  False,
+            "ig_category":  "",
+        }
+
+    return None
+
+
 def fetch_profile(username: str) -> dict | None:
+    """
+    Multi-strategy Instagram profile fetcher.
+
+    Strategy order (fastest/most reliable first):
+      1. XHR intercept: web_profile_info  (IG private API — best data, often blocked)
+      2. XHR intercept: graphql/query     (older IG API endpoint)
+      3. HTML extraction: window.__additionalDataLoaded / _sharedData / JSON blobs
+      4. Meta-tag fallback: og:title + og:description (always present, follower count only)
+    """
     def _job(browser):
         ctx  = _make_context(browser)
         page = ctx.new_page()
         try:
-            captured: list[dict] = []
+            captured_xhr: list[dict] = []
+
             def on_response(response):
                 try:
-                    if "web_profile_info" in response.url and response.status == 200:
-                        captured.append(response.json())
-                except Exception: pass
+                    url = response.url
+                    if response.status != 200:
+                        return
+                    if ("web_profile_info" in url
+                            or "graphql/query" in url
+                            or "/api/v1/users/" in url):
+                        data = response.json()
+                        captured_xhr.append(data)
+                except Exception:
+                    pass
+
             page.on("response", on_response)
-            page.goto(f"https://www.instagram.com/{username}/",
-                      wait_until="domcontentloaded", timeout=18_000)
-            page.wait_for_timeout(3000)
-            user: dict | None = None
-            for body in captured:
+
+            page.goto(
+                f"https://www.instagram.com/{username}/",
+                wait_until="domcontentloaded",
+                timeout=20_000,
+            )
+            # Give XHR a bit of time; also lets lazy JS embeds run
+            page.wait_for_timeout(3500)
+
+            # ── Strategy 1 & 2: XHR data ──────────────────────────────────
+            for body in captured_xhr:
                 user = (body.get("data", {}).get("user")
                         or body.get("graphql", {}).get("user")
                         or body.get("user"))
-                if user: break
-            if not user:
-                content = page.content()
-                if '"biography"' in content:
-                    for m in re.finditer(r'\{[^{}]{200,}\}', content):
-                        try:
-                            d = json.loads(m.group(0))
-                            if d.get("username") and d.get("biography") is not None:
-                                user = d; break
-                        except Exception: pass
-            if not user: return None
-            followers  = user.get("edge_followed_by", {}).get("count") or user.get("follower_count", 0)
-            following  = user.get("edge_follow", {}).get("count") or user.get("following_count", 0)
-            post_count = user.get("edge_owner_to_timeline_media", {}).get("count") or user.get("media_count", 0)
-            return {
-                "username":     user.get("username", username),
-                "full_name":    user.get("full_name", ""),
-                "followers":    int(followers or 0),
-                "following":    int(following or 0),
-                "post_count":   int(post_count or 0),
-                "bio":          user.get("biography", ""),
-                "external_url": user.get("external_url", "") or "",
-                "is_verified":  bool(user.get("is_verified", False)),
-                "is_business":  bool(user.get("is_business_account", False) or user.get("is_professional_account", False)),
-                "ig_category":  user.get("category_name", "") or user.get("category", "") or "",
-            }
+                if not user:
+                    # /api/v1/users/{id}/info/ format
+                    user = body.get("user") or body
+                result = _normalise_user(user, username)
+                if result and result.get("followers", 0) > 0:
+                    return result
+
+            # ── Strategy 3 & 4: HTML extraction ───────────────────────────
+            content = page.content()
+            result  = _extract_user_from_html(content, username)
+            return result
+
         finally:
-            page.close(); ctx.close()
+            page.close()
+            ctx.close()
 
     try:
         p = browser_run(_job)
-        if p: log.info(f"@{username}: {p['followers']:,} followers")
-        else: log.warning(f"@{username}: no data")
+        if p and p.get("followers", 0) > 0:
+            log.info(f"@{username}: {p['followers']:,} followers | bio: {len(p.get('bio',''))} chars")
+        elif p:
+            log.info(f"@{username}: fetched (0 followers — meta fallback)")
+        else:
+            log.warning(f"@{username}: no data from any strategy")
         return p
     except Exception as e:
         log.warning(f"fetch_profile @{username}: {e}")
@@ -584,6 +817,76 @@ def build_search_queries(niche: str, geo_filter: str, explicit: list[str]) -> li
 # Pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
+def score_profile_with_gemini(profile: dict, gem: dict, geo_filter: str,
+                              min_followers: int, max_followers: int) -> tuple[int, list[str], list[str]]:
+    """
+    Tier a profile using Gemini-enriched data instead of regex signals.
+    Tier 1 — hot : follower range ✓ | small biz ✓ | WA signal ✓ | niche valid ✓ | geo ✓ (or no geo set)
+    Tier 2 — partial : follower range ✓ | WA signal ✓ | niche valid ✓ | geo fails
+    Tier 3 — weak : follower range ✓ | no WA signal OR low confidence | not disqualified
+    Tier 4 — out : follower range ✗ | large brand | influencer | is_verified
+    """
+    followers  = profile.get("followers", 0)
+    verified   = profile.get("is_verified", False)
+    # 0 = meta-tag fallback (follower count unknown) — don't disqualify on range
+    in_range   = (followers == 0) or (min_followers <= followers <= max_followers)
+    large      = gem.get("is_large_brand", False) or (followers > max_followers and followers > 0)
+    influencer = gem.get("is_influencer", False)
+
+    met, missing = [], []
+
+    if followers == 0:
+        met.append("Followers: unknown (meta-fallback)")
+    elif in_range:
+        met.append(f"Followers {followers:,} in range")
+    else:
+        missing.append(f"Followers {followers:,} out of range ({min_followers:,}–{max_followers:,})")
+    if verified:
+        missing.append("Verified account")
+    if large:
+        missing.append("Large brand / chain")
+    if influencer:
+        missing.append("Influencer — no own product")
+
+    if not in_range or verified or large or influencer:
+        return 4, met, missing
+
+    # WA signal from Gemini
+    wa = gem.get("whatsapp_signal", False) or bool(gem.get("whatsapp_number", ""))
+    valid = gem.get("valid", False)
+    conf  = gem.get("confidence", "low")
+
+    if wa:
+        wa_num = gem.get("whatsapp_number", "")
+        met.append(f"WA signal{' — ' + wa_num if wa_num else ''}")
+    else:
+        missing.append("No WhatsApp signal found by AI")
+
+    if valid:
+        met.append(f"Niche match ({conf} confidence)")
+    else:
+        missing.append(f"Niche mismatch: {gem.get('reason','')[:60]}")
+
+    # Geo check — use AI-extracted city/state first, fall back to regex
+    geo_ok = True
+    if geo_filter:
+        ai_loc = f"{gem.get('city','')} {gem.get('state','')}".lower()
+        bio_text = f"{profile.get('bio','')} {profile.get('full_name','')} {profile.get('username','')}".lower()
+        combined_loc = f"{ai_loc} {bio_text}"
+        geo_ok = any(w.strip() in combined_loc for w in geo_filter.lower().split(",") if w.strip())
+        if geo_ok:
+            loc_label = gem.get("city") or gem.get("state") or geo_filter
+            met.append(f"Geo match — {loc_label}")
+        else:
+            missing.append(f"No geo match for '{geo_filter}'")
+
+    if wa and valid and geo_ok:
+        return 1, met, missing
+    if wa and valid and not geo_ok:
+        return 2, met, missing
+    return 3, met, missing
+
+
 def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
                  search_keywords=None, min_followers=MIN_FOLLOWERS, max_followers=MAX_FOLLOWERS,
                  niche_preset=None):
@@ -596,6 +899,7 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
     if not hashtags and not search_keywords and not (niche and geo_filter):
         yield {"type": "error", "message": "No hashtags or search keywords provided."}; return
 
+    # ── Phase 1a: hashtag scraping ─────────────────────────────────────────────
     all_usernames: set[str] = set()
     done_tags = []
 
@@ -616,10 +920,11 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
                    "total_users": len(all_usernames)}
             time.sleep(random.uniform(2, 4))
 
+    # ── Phase 1b: keyword search ───────────────────────────────────────────────
     queries = build_search_queries(niche, geo_filter, search_keywords or [])
     if queries:
         yield {"type": "progress", "stage": "hashtag_scan",
-               "detail": f"Running {len(queries)} profile search quer{'y' if len(queries)==1 else 'ies'}…"}
+               "detail": f"Running {len(queries)} keyword search quer{'y' if len(queries)==1 else 'ies'}…"}
         for q in queries:
             users  = collect_usernames_from_search(q, 50)
             before = len(all_usernames)
@@ -632,6 +937,7 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
     if not all_usernames:
         yield {"type": "error", "message": "No accounts found. Try different hashtags or keywords."}; return
 
+    # ── Phase 2: fetch full profiles ───────────────────────────────────────────
     yield {"type": "progress", "stage": "profiles",
            "detail": f"Fetching full profiles for {len(all_usernames)} accounts…"}
 
@@ -643,10 +949,18 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
         profile = fetch_profile(uname)
         fetched += 1
         if profile:
-            all_profiles[uname] = profile
+            foll = profile.get("followers", 0)
+            # Keep if: followers in range, OR we got 0 (meta-fallback — let Gemini decide)
+            # Drop only if we have a definitive over/under count
+            if foll > 0 and foll < min_followers * 0.5:
+                log.info(f"@{uname}: {foll:,} followers — pre-filtered (too few)")
+            elif foll > max_followers * 2:
+                log.info(f"@{uname}: {foll:,} followers — pre-filtered (too many)")
+            else:
+                all_profiles[uname] = profile
         if fetched % 5 == 0 or fetched == len(username_list):
             yield {"type": "progress", "stage": "profiles",
-                   "detail": f"Profiles fetched: {fetched} / {len(username_list)}",
+                   "detail": f"Profiles fetched: {fetched} / {len(username_list)} ({len(all_profiles)} passed filter)",
                    "fetched": fetched, "total": len(username_list)}
         time.sleep(random.uniform(1.5, 3.0))
 
@@ -654,57 +968,70 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
         yield {"type": "error", "message": "Profile fetch returned no data. Instagram may be throttling — try again in a few minutes."}
         return
 
+    # ── Phase 3: Gemini parses EVERY profile in parallel ──────────────────────
+    # This is the new early-AI step. Gemini extracts city, WA number, category,
+    # products, business type, and qualifies the lead — all in one call per profile.
+    total_to_parse = len(all_profiles)
+    yield {"type": "progress", "stage": "gemini",
+           "detail": f"AI parsing {total_to_parse} profiles — extracting WA numbers, cities, categories…",
+           "total_candidates": total_to_parse, "validated": 0}
+
+    gem_results: dict[str, dict] = {}   # username → gemini output
+    parsed_count = 0
+
+    def _parse_one(uname_profile):
+        uname, prof = uname_profile
+        url = prof.get("external_url", "")
+        extra = ""
+        if url and any(lp in url.lower() for lp in LINK_PAGES):
+            extra = fetch_bio_link(url)
+        if debug_mode:
+            # In debug, skip Gemini but still fetch bio-link
+            return uname, prof, extra, {
+                **_GEMINI_EMPTY,
+                "valid": True, "confidence": "n/a",
+                "whatsapp_signal": has_wa_signal(prof.get("bio",""), url, extra),
+                "whatsapp_number": extract_wa_number(prof.get("bio",""), extra),
+                "city": extract_city(prof.get("bio",""), prof.get("full_name","")),
+                "category": prof.get("ig_category",""),
+                "reason": "DEBUG mode — Gemini skipped",
+                "gemini_ran": False,
+                "is_small_business": True,
+                "is_large_brand": is_large_brand(prof.get("bio",""), prof.get("followers",0)),
+                "is_influencer": False,
+            }
+        gem = gemini_parse_profile(prof, niche, extra)
+        return uname, prof, extra, gem
+
+    # Use 8 workers — Gemini 2.5 Flash handles concurrent requests well
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(_parse_one, item): item for item in all_profiles.items()}
+        for fut in as_completed(futs):
+            uname, prof, extra, gem = fut.result()
+            gem_results[uname] = (prof, extra, gem)
+            parsed_count += 1
+            yield {"type": "progress", "stage": "gemini",
+                   "detail": f"AI parsed {parsed_count} / {total_to_parse} profiles…",
+                   "validated": parsed_count, "total_candidates": total_to_parse}
+
+    # ── Phase 4: Score & tier using Gemini data ────────────────────────────────
     yield {"type": "progress", "stage": "filtering",
-           "detail": f"Scoring and tiering {len(all_profiles)} profiles…"}
+           "detail": f"Tiering {total_to_parse} AI-enriched profiles…"}
 
     tiered: dict[int, list] = {1: [], 2: [], 3: [], 4: []}
 
-    for uname, profile in all_profiles.items():
-        bio = profile.get("bio", "")
-        url = profile.get("external_url", "")
-        extra_text = ""
-        if url and any(lp in url.lower() for lp in LINK_PAGES):
-            extra_text = fetch_bio_link(url)
-
-        tier, met, missing = score_profile(profile, geo_filter, min_followers, max_followers, extra_text)
-        tiered[tier].append((profile, extra_text, met, missing))
+    for uname, (prof, extra, gem) in gem_results.items():
+        tier, met, missing = score_profile_with_gemini(prof, gem, geo_filter, min_followers, max_followers)
+        tiered[tier].append((prof, extra, gem, met, missing))
 
     yield {"type": "tier_summary",
            "counts": {str(t): len(v) for t, v in tiered.items()},
-           "total": len(all_profiles)}
+           "total": total_to_parse}
 
-    hot_candidates = tiered[1] if not debug_mode else tiered[1] + tiered[2]
+    # ── Phase 5: emit all profiles grouped by tier ─────────────────────────────
+    row_n    = 0
+    exported = 0
 
-    yield {"type": "progress", "stage": "gemini",
-           "detail": f"{len(hot_candidates)} hot candidates → Gemini validation…",
-           "total_candidates": len(hot_candidates)}
-
-    exported  = 0
-    validated = 0
-    gemini_results: dict[str, dict] = {}
-
-    def validate_one(args):
-        profile, extra_text, met, missing = args
-        if debug_mode:
-            return profile, extra_text, met, missing, {
-                "valid": True, "confidence": "n/a", "city": "", "category": "",
-                "reason": "DEBUG — shown regardless of signals",
-            }
-        return profile, extra_text, met, missing, gemini_validate(profile, niche, extra_text)
-
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        futs = {ex.submit(validate_one, c): c for c in hot_candidates[:limit]}
-        for fut in as_completed(futs):
-            profile, extra_text, met, missing, gem = fut.result()
-            validated += 1
-            username  = profile["username"]
-            gemini_results[username] = gem
-
-            yield {"type": "progress", "stage": "gemini",
-                   "detail": f"Validated {validated}/{len(hot_candidates)}",
-                   "validated": validated, "total_candidates": len(hot_candidates)}
-
-    row_n = 0
     for tier in [1, 2, 3, 4]:
         if not tiered[tier]:
             continue
@@ -712,38 +1039,51 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
         yield {"type": "tier_header", "tier": tier, "label": TIER_LABELS[tier],
                "count": len(tiered[tier])}
 
-        for profile, extra_text, met, missing in tiered[tier]:
-            row_n += 1
-            username  = profile["username"]
-            bio       = profile.get("bio", "")
-            url       = profile.get("external_url", "")
-            gem       = gemini_results.get(username, {})
+        for prof, extra, gem, met, missing in tiered[tier]:
+            row_n   += 1
+            username = prof["username"]
+            bio      = prof.get("bio", "")
+            url      = prof.get("external_url", "")
 
-            wa_number = extract_wa_number(bio, extra_text)
-            city      = gem.get("city") or extract_city(bio, profile.get("full_name", ""))
-            category  = gem.get("category") or profile.get("ig_category") or "—"
-            confidence = gem.get("confidence", "—") if gem else "—"
-            gemini_valid = gem.get("valid", None) if gem else None
+            # Prefer Gemini-extracted fields, fall back to regex
+            wa_number = gem.get("whatsapp_number") or extract_wa_number(bio, extra)
+            city      = gem.get("city") or extract_city(bio, prof.get("full_name", ""))
+            state     = gem.get("state", "")
+            category  = gem.get("category") or prof.get("ig_category") or "—"
+            biz_type  = gem.get("business_type", "")
+            products  = gem.get("products_or_services", "")
+            languages = gem.get("languages", "")
+            ordering  = gem.get("ordering_method", "")
+            confidence= gem.get("confidence", "—")
+            gemini_valid = gem.get("valid", False)
+            gemini_ran   = gem.get("gemini_ran", False)
 
             profile_data = {
-                "business_name":     profile.get("full_name") or username,
+                "business_name":     prof.get("full_name") or username,
                 "page_name":         f"@{username}",
                 "business_category": category,
+                "business_type":     biz_type,
                 "city":              city,
+                "state":             state,
                 "whatsapp_number":   wa_number,
                 "confidence":        confidence,
                 "gemini_valid":      gemini_valid,
-                "followers":         profile.get("followers", 0),
-                "following":         profile.get("following", 0),
-                "total_posts":       profile.get("post_count", 0),
-                "is_business_acct":  "Yes" if profile.get("is_business") else "No",
+                "gemini_ran":        gemini_ran,
+                "sells_on_whatsapp": gem.get("sells_on_whatsapp", False),
+                "ordering_method":   ordering,
+                "products_services": products,
+                "languages":         languages,
+                "followers":         prof.get("followers", 0),
+                "following":         prof.get("following", 0),
+                "total_posts":       prof.get("post_count", 0),
+                "is_business_acct":  "Yes" if prof.get("is_business") else "No",
                 "bio":               bio[:250],
                 "website":           url,
                 "ig_url":            f"https://instagram.com/{username}",
                 "gemini_reason":     gem.get("reason", ""),
                 "met":               met,
                 "missing":           missing,
-                "scraped_at":        datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+                "scraped_at":        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                 "niche_preset":      niche_preset or "",
             }
 
@@ -753,28 +1093,37 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
                     conn = get_db()
                     conn.execute("""
                         INSERT OR IGNORE INTO leads
-                          (username, business_name, category, city, whatsapp_number,
-                           followers, bio, ig_url, website, tier, confidence, niche_preset)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, (username, profile_data["business_name"], category, city, wa_number,
-                          profile.get("followers", 0), bio[:500], f"https://instagram.com/{username}",
-                          url, tier, confidence, niche_preset or ""))
+                          (username, business_name, category, business_type,
+                           city, state, whatsapp_number,
+                           followers, bio, ig_url, website,
+                           tier, confidence, niche_preset,
+                           sells_on_whatsapp, ordering_method, products_services,
+                           languages, gemini_reason)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (username, profile_data["business_name"], category, biz_type,
+                          city, state, wa_number,
+                          prof.get("followers", 0), bio[:500],
+                          f"https://instagram.com/{username}", url,
+                          tier, confidence, niche_preset or "",
+                          1 if gem.get("sells_on_whatsapp") else 0,
+                          ordering, products, languages,
+                          gem.get("reason", "")))
                     conn.commit()
                     conn.close()
                 except Exception as e:
                     log.warning(f"CRM save failed for @{username}: {e}")
 
             yield {
-                "type":     "profile",
-                "tier":     tier,
-                "row_n":    row_n,
-                "profile":  profile_data,
+                "type":    "profile",
+                "tier":    tier,
+                "row_n":   row_n,
+                "profile": profile_data,
             }
 
             if tier == 1 and gemini_valid:
                 exported += 1
 
-    yield {"type": "done", "total": exported, "total_profiles": len(all_profiles),
+    yield {"type": "done", "total": exported, "total_profiles": total_to_parse,
            "tier_counts": {str(t): len(v) for t, v in tiered.items()}}
 
 
@@ -820,9 +1169,12 @@ def export_csv():
         return jsonify({"error": "No leads to export."}), 400
 
     si     = StringIO()
-    fields = ["business_name","page_name","business_category","city","whatsapp_number",
-              "confidence","gemini_valid","tier","followers","following","total_posts",
-              "is_business_acct","bio","website","ig_url","met","missing","gemini_reason","scraped_at"]
+    fields = ["business_name","page_name","business_category","business_type",
+              "city","state","whatsapp_number","confidence","gemini_valid","gemini_ran",
+              "sells_on_whatsapp","ordering_method","products_services","languages",
+              "tier","followers","following","total_posts",
+              "is_business_acct","bio","website","ig_url",
+              "met","missing","gemini_reason","scraped_at"]
     writer = csv.DictWriter(si, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
     for lead in leads:
@@ -831,7 +1183,7 @@ def export_csv():
         row["missing"] = " | ".join(lead.get("missing", []))
         writer.writerow(row)
 
-    fname = f"wa_leads_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    fname = f"wa_leads_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
     return Response(si.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": f"attachment; filename={fname}"})
 
@@ -890,9 +1242,9 @@ def crm_update_lead(lead_id):
             fields[k] = data[k]
 
     if "outreach_status" in fields and fields["outreach_status"] != "not_contacted":
-        fields["outreach_sent_at"] = datetime.utcnow().isoformat()
+        fields["outreach_sent_at"] = datetime.now(timezone.utc).isoformat()
     if "responded" in fields and fields["responded"]:
-        fields["responded_at"] = datetime.utcnow().isoformat()
+        fields["responded_at"] = datetime.now(timezone.utc).isoformat()
 
     if not fields:
         return jsonify({"error": "Nothing to update"}), 400
@@ -928,7 +1280,7 @@ def crm_bulk_update():
     placeholders = ",".join("?" * len(ids))
     conn.execute(
         f"UPDATE leads SET outreach_status=?, outreach_notes=?, outreach_sent_at=? WHERE id IN ({placeholders})",
-        [status, notes, datetime.utcnow().isoformat()] + ids
+        [status, notes, datetime.now(timezone.utc).isoformat()] + ids
     )
     conn.commit()
     conn.close()
@@ -966,7 +1318,7 @@ def crm_export():
     for row in rows:
         writer.writerow(dict(row))
 
-    fname = f"crm_leads_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    fname = f"crm_leads_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
     return Response(si.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": f"attachment; filename={fname}"})
 

@@ -389,8 +389,8 @@ tr.tier-row.t4 { border-left-color: #5a607540; opacity: 0.65; }
       <div class="stages">
         <div class="stage-pill" id="stage-hashtag">🔍 Hashtag scan</div>
         <div class="stage-pill" id="stage-profiles">👤 Profile fetch</div>
-        <div class="stage-pill" id="stage-filter">⚡ Scoring</div>
-        <div class="stage-pill" id="stage-gemini">✦ Gemini validate</div>
+        <div class="stage-pill" id="stage-gemini">✦ AI parse all</div>
+        <div class="stage-pill" id="stage-filter">⚡ Tier & score</div>
       </div>
       <div id="progbar-wrap" style="display:none">
         <div class="prog-bar-wrap"><div class="prog-bar" id="prog-bar"></div></div>
@@ -426,13 +426,12 @@ tr.tier-row.t4 { border-left-color: #5a607540; opacity: 0.65; }
             <tr>
               <th>#</th>
               <th>Account</th>
-              <th>Category</th>
-              <th>City</th>
+              <th>Category / Products</th>
+              <th>City · State</th>
               <th>WhatsApp</th>
               <th>Confidence</th>
+              <th>Ordering</th>
               <th>Followers</th>
-              <th>Posts</th>
-              <th>Biz</th>
               <th>Signals</th>
               <th>Bio</th>
               <th>CRM</th>
@@ -716,7 +715,7 @@ function renderTable() {
       const hdr = document.createElement('tr');
       hdr.className = `tier-hdr t${item.tier}`;
       const c = visible.filter(p => p.tier === item.tier).length;
-      hdr.innerHTML = `<td colspan="12">${tierLabels[item.tier]} <span style="font-weight:400;opacity:0.7">(${c})</span></td>`;
+      hdr.innerHTML = `<td colspan="11">${tierLabels[item.tier]} <span style="font-weight:400;opacity:0.7">(${c})</span></td>`;
       tbody.appendChild(hdr);
     }
     tbody.appendChild(buildRow(item, idx+1));
@@ -729,21 +728,46 @@ function buildRow(item, n) {
   tr.className = `tier-row t${item.tier} new-row`;
 
   const username = p.page_name.replace('@','');
+
+  // WhatsApp — clickable number from AI extraction
   const waDisplay = p.whatsapp_number
     ? `<a class="wa-link" href="https://wa.me/${p.whatsapp_number.replace(/\D/g,'')}" target="_blank">📱 ${esc(p.whatsapp_number)}</a>`
+    : `<span style="color:var(--muted);font-size:10px">not found</span>`;
+
+  // City + state from AI
+  const locParts = [p.city, p.state].filter(Boolean);
+  const cityDisplay = locParts.length
+    ? `<span class="city-badge">📍 ${esc(locParts.join(', '))}</span>`
     : `<span style="color:var(--muted)">—</span>`;
-  const cityDisplay = p.city
-    ? `<span class="city-badge">📍 ${esc(p.city)}</span>`
-    : `<span style="color:var(--muted)">—</span>`;
+
+  // Confidence badge
   let confClass = 'conf-na';
   if (p.confidence==='high') confClass='conf-high';
   else if (p.confidence==='medium') confClass='conf-med';
   else if (p.confidence==='low') confClass='conf-low';
   const verdictIcon = p.gemini_valid===true
-    ? ' <span style="color:#4ade80;font-size:10px">✓ AI</span>'
-    : (p.gemini_valid===false ? ' <span style="color:#fca5a5;font-size:10px">✗ AI</span>' : '');
+    ? ' <span style="color:#4ade80;font-size:10px">✓</span>'
+    : (p.gemini_valid===false ? ' <span style="color:#fca5a5;font-size:10px">✗</span>' : '');
+  const aiIcon = p.gemini_ran
+    ? '<span title="AI parsed" style="color:#c084fc;font-size:9px;margin-left:3px">✦AI</span>'
+    : '<span title="Regex fallback" style="color:var(--muted);font-size:9px;margin-left:3px">re</span>';
+
+  // Category + products from AI
+  const catHtml = p.business_category && p.business_category !== '—'
+    ? `<span class="cat-badge">${esc(p.business_category)}</span>`
+    : '';
+  const prodHtml = p.products_services
+    ? `<div style="font-size:9px;color:var(--muted2);margin-top:3px;max-width:140px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis" title="${esc(p.products_services)}">${esc(p.products_services)}</div>`
+    : '';
+
+  // Ordering method
+  const orderHtml = p.ordering_method
+    ? `<span style="font-size:10px;color:var(--muted2)">${esc(p.ordering_method)}</span>`
+    : '<span style="color:var(--muted)">—</span>';
+
   const metHtml    = (p.met||[]).map(s=>`<span class="sig met">${esc(s)}</span>`).join('');
   const missingHtml= (p.missing||[]).map(s=>`<span class="sig missing">${esc(s)}</span>`).join('');
+
   const isSaved = savedUsernames.has(username);
   const crmBtn = item.tier===1 && p.gemini_valid
     ? `<button class="btn btn-save-crm ${isSaved?'saved':''}" id="crm-${username}" onclick="saveOneToCRM('${username}',this)">${isSaved?'✓ Saved':'+ CRM'}</button>`
@@ -753,15 +777,14 @@ function buildRow(item, n) {
     <td style="color:var(--muted);font-size:10px">${n}</td>
     <td>
       <a class="page-name" href="${esc(p.ig_url)}" target="_blank">${esc(p.page_name)}</a>
-      <div class="biz-name">${esc(p.business_name)}</div>
+      <div class="biz-name">${esc(p.business_name)}${aiIcon}</div>
     </td>
-    <td>${p.business_category!=='—'?`<span class="cat-badge">${esc(p.business_category)}</span>`:'<span style="color:var(--muted)">—</span>'}</td>
+    <td>${catHtml}${prodHtml}</td>
     <td>${cityDisplay}</td>
     <td>${waDisplay}</td>
     <td><span class="conf-badge ${confClass}">${esc(p.confidence)}${verdictIcon}</span></td>
+    <td>${orderHtml}</td>
     <td><span class="stat-num">${fmtNum(p.followers)}</span></td>
-    <td><span style="color:var(--muted2)">${p.total_posts||'—'}</span></td>
-    <td style="font-size:10px;color:${p.is_business_acct==='Yes'?'var(--accent)':'var(--muted)'}">${p.is_business_acct==='Yes'?'✓':'—'}</td>
     <td><div class="signals">${metHtml}${missingHtml}</div></td>
     <td class="bio-cell" title="${esc(p.bio)}">${esc(p.bio||'—')}</td>
     <td>${crmBtn}</td>
@@ -827,7 +850,7 @@ function startScan() {
   document.getElementById('progbar-wrap').style.display='none';
   document.getElementById('prog-title').textContent='Starting pipeline…';
   document.getElementById('prog-sub').textContent='';
-  ['stage-hashtag','stage-profiles','stage-filter','stage-gemini'].forEach(s =>
+  ['stage-hashtag','stage-profiles','stage-gemini','stage-filter'].forEach(s =>
     document.getElementById(s).className='stage-pill');
   setStageActive('stage-hashtag');
 
@@ -892,25 +915,28 @@ function handleProgress(msg) {
     if (msg.fetched && msg.total)
       document.getElementById('prog-sub').textContent = Math.round(msg.fetched/msg.total*100)+'% complete';
     addLog(msg.detail,'info');
-  } else if (stage==='filtering') {
-    setStagesDone('stage-hashtag','stage-profiles'); setStageActive('stage-filter');
-    document.getElementById('prog-title').textContent = msg.detail;
-    addLog(msg.detail,'info');
   } else if (stage==='gemini') {
-    setStagesDone('stage-hashtag','stage-profiles','stage-filter'); setStageActive('stage-gemini');
-    document.getElementById('prog-title').textContent = 'Gemini AI validation in progress…';
+    // NEW: Gemini now runs on ALL profiles right after fetch
+    setStagesDone('stage-hashtag','stage-profiles'); setStageActive('stage-gemini');
     document.getElementById('progbar-wrap').style.display='';
-    addLog(msg.detail,'gemini');
-    if (msg.validated!==undefined && msg.total_candidates) {
-      const pct = Math.round(msg.validated/msg.total_candidates*100);
-      document.getElementById('prog-bar').style.width = pct+'%';
-    }
+    const done = msg.validated||0, total = msg.total_candidates||1;
+    const pct  = Math.round(done/total*100);
+    document.getElementById('prog-title').textContent =
+      `✦ AI parsing profiles… ${done} / ${total}`;
+    document.getElementById('prog-sub').textContent = `${pct}% — extracting WA numbers, cities, categories`;
+    document.getElementById('prog-bar').style.width = pct+'%';
+    if (done % 5 === 0 || done === total) addLog(msg.detail,'gemini');
+  } else if (stage==='filtering') {
+    setStagesDone('stage-hashtag','stage-profiles','stage-gemini'); setStageActive('stage-filter');
+    document.getElementById('prog-title').textContent = msg.detail;
+    document.getElementById('prog-bar').style.width = '100%';
+    addLog(msg.detail,'info');
   }
 }
 
 function handleTierSummary(msg) {
   const c = msg.counts||{};
-  addLog(`Scored ${msg.total} profiles — 🔥${c['1']||0} hot / ⚡${c['2']||0} partial / 🔍${c['3']||0} weak`, 'gemini');
+  addLog(`AI parsed ${msg.total} profiles → 🔥${c['1']||0} hot / ⚡${c['2']||0} partial / 🔍${c['3']||0} weak / ⬇${c['4']||0} out-of-range`, 'gemini');
 }
 
 function handleProfile(msg) {
@@ -931,11 +957,11 @@ function handleProfile(msg) {
 }
 
 function handleDone(msg) {
-  addLog(`✓ Done — ${msg.total_profiles} profiles, ${msg.total} hot leads saved to CRM`,'ok');
-  document.getElementById('prog-title').textContent = `Scan complete — ${msg.total_profiles} profiles found`;
+  addLog(`✓ Done — ${msg.total_profiles} profiles AI-parsed, ${msg.total} hot leads saved to CRM`,'ok');
+  document.getElementById('prog-title').textContent = `Scan complete — ${msg.total_profiles} AI-enriched profiles`;
   document.getElementById('prog-sub').textContent   = `${msg.total} hot leads`;
   document.getElementById('main-spinner').style.display='none';
-  setStagesDone('stage-hashtag','stage-profiles','stage-filter','stage-gemini');
+  setStagesDone('stage-hashtag','stage-profiles','stage-gemini','stage-filter');
   document.getElementById('btn-save-all').disabled=false;
   finishScan();
 }
@@ -1046,10 +1072,24 @@ function buildCRMRow(lead) {
   const presetLabel = preset ? preset.label : (lead.niche_preset||'—');
   const waDisplay = lead.whatsapp_number
     ? `<a class="wa-link" href="https://wa.me/${lead.whatsapp_number.replace(/\D/g,'')}" target="_blank">📱 ${esc(lead.whatsapp_number)}</a>`
-    : `<span style="color:var(--muted)">—</span>`;
+    : `<span style="color:var(--muted);font-size:10px">not found</span>`;
   const addedDate = lead.added_at ? lead.added_at.slice(0,10) : '—';
   const statusClass = `s-${lead.outreach_status||'not_contacted'}`;
   const statusLabel = STATUS_LABELS[lead.outreach_status] || lead.outreach_status;
+
+  // Location: city + state from AI
+  const locParts = [lead.city, lead.state].filter(Boolean);
+  const locDisplay = locParts.length
+    ? `<span class="city-badge">📍 ${esc(locParts.join(', '))}</span>`
+    : '<span style="color:var(--muted)">—</span>';
+
+  // Category + products tooltip
+  const catHtml = lead.category
+    ? `<span class="cat-badge" style="font-size:9px">${esc(lead.category)}</span>`
+    : '';
+  const prodHtml = lead.products_services
+    ? `<div style="font-size:9px;color:var(--muted2);margin-top:2px;max-width:130px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis" title="${esc(lead.products_services)}">${esc(lead.products_services)}</div>`
+    : '';
 
   return `<tr>
     <td><input type="checkbox" class="crm-check" data-id="${lead.id}" onchange="crmToggle(${lead.id},this.checked)"></td>
@@ -1057,15 +1097,15 @@ function buildCRMRow(lead) {
       <a class="page-name" href="https://instagram.com/${lead.username}" target="_blank">@${esc(lead.username)}</a>
       <div class="biz-name">${esc(lead.business_name||'')}</div>
     </td>
-    <td style="font-size:10px;color:var(--muted2)">${esc(presetLabel)}</td>
-    <td>${lead.city?`<span class="city-badge">📍 ${esc(lead.city)}</span>`:'<span style="color:var(--muted)">—</span>'}</td>
+    <td>${catHtml}${prodHtml}</td>
+    <td>${locDisplay}</td>
     <td>${waDisplay}</td>
     <td style="font-size:11px">${fmtNum(lead.followers)}</td>
     <td><span class="s-badge ${statusClass}">${statusLabel}</span></td>
     <td style="font-size:10px;color:${lead.responded?'var(--accent)':'var(--muted)'}">${lead.responded?'✓ Yes':'—'}</td>
     <td style="font-size:10px;color:var(--muted2)">${addedDate}</td>
     <td>
-      <button class="btn btn-blue action-btn" onclick="openModal(${lead.id},'${esc(lead.username)}','${lead.outreach_status||'not_contacted'}','${esc(lead.outreach_notes||'')}','${esc(lead.response_notes||'')}',${lead.responded||0})">✏ Update</button>
+      <button class="btn btn-blue action-btn" onclick="openModal(${lead.id},'${esc(lead.username)}','${lead.outreach_status||'not_contacted'}','${esc((lead.outreach_notes||'').replace(/'/g,"\\'"))}','${esc((lead.response_notes||'').replace(/'/g,"\\'"))}',${lead.responded||0})">✏ Update</button>
       <a class="btn btn-ghost action-btn" href="https://wa.me/${(lead.whatsapp_number||'').replace(/\D/g,'')}" target="_blank" ${!lead.whatsapp_number?'style="pointer-events:none;opacity:0.4"':''}>💬 WA</a>
     </td>
   </tr>`;
