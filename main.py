@@ -7,16 +7,20 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
+# Suppress noisy DEBUG from urllib3/requests — keep our own debug clean
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("playwright").setLevel(logging.WARNING)
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 
-MIN_FOLLOWERS = 10_000
-MAX_FOLLOWERS = 500_000
+MIN_FOLLOWERS = 1_000
+MAX_FOLLOWERS = 200_000
 
 WA_LINK_RE = re.compile(r"wa\.me/(\d+)|whatsapp\.com/send\?phone=(\d+)", re.I)
 PHONE_RE   = re.compile(r"(?<!\d)(\+?91[\s\-]?[6-9]\d{9}|[6-9]\d{9})(?!\d)")
@@ -52,78 +56,93 @@ TIER_LABELS = {
 }
 
 # ── Business niche presets ─────────────────────────────────────────────────────
+# Hashtag strategy: use ORDER-INTENT tags (not food blogger tags).
+# Tags like #whatsapporders, #homedelivery, #orderonwhatsapp pull actual sellers.
+# Geo-specific Telugu tags find Hyderabad/Andhra home businesses.
 NICHE_PRESETS = {
     "sweets_pickles": {
         "label": "🍬 Sweets & Pickles",
-        "niche": "homemade sweets, pickles, achaar, mithai, traditional food",
-        "hashtags": "hyderabadsweets,telugusweets,andhrasweets,homemadesweets,mithai,traditionalsweets,andhrapickles,teluguachaar,homemadepickles,avakaya,gongura,pachadi,handmadesweets,desisweets",
-        "geo": "hyderabad,andhra,telangana",
+        "niche": "homemade sweets, pickles, achaar, mithai, traditional Telugu food, avakaya, gongura, home delivery sweets",
+        "hashtags": "homemadesweets,homemadesweet,homemadepickles,pickleorders,acharorders,avakayapickle,gonguraorders,telugusweets,andhrasweets,sweetsdelivery,mithaiorders,traditionalsweets,handmadesweets,homemadefood,homemadefoodbusiness",
+        "geo": "hyderabad,andhra,telangana,secunderabad",
+        "search_keywords": "homemade sweets order hyderabad whatsapp,avakaya pickle order online,gongura pickle home delivery,andhra pickles order",
     },
     "aquaculture": {
         "label": "🐟 Aquaculture & Sea Fish Export",
-        "niche": "fish export, seafood, aquaculture, fresh fish delivery, prawns",
-        "hashtags": "seafoodexport,freshfish,aquaculture,fishfarm,prawnexport,hyderabadfishmarket,andhraseafood,vizagfish,seafooddelivery,freshseafood,fishsupplier",
+        "niche": "fish export, seafood, aquaculture, fresh fish home delivery, prawns, bulk fish supply",
+        "hashtags": "freshfishdelivery,fishdeliveryhome,seafoodhomedelivery,freshfishorders,prawndelivery,fishsupplier,seafoodsupplier,fishexporter,aquaculturebusiness,freshwaterfish,fishbusiness,homedeliveryfish",
         "geo": "hyderabad,vizag,kakinada,andhra,telangana",
+        "search_keywords": "fresh fish home delivery hyderabad,seafood supplier bulk order,prawns home delivery andhra,fish export vizag whatsapp",
     },
     "travel_agents": {
         "label": "✈️ Travel Agents",
-        "niche": "travel agent, tour packages, holiday packages, visa, flight booking",
-        "hashtags": "travelagent,tourpackages,holidaypackage,hyderabadtravel,indiatravel,touroperator,visaconsultant,travelbusiness,tourplanner,travelagency",
+        "niche": "travel agent, tour packages, holiday booking, visa service, flight tickets, honeymoon packages",
+        "hashtags": "travelagentindia,tourpackagesindia,travelagency,holidaypackages,visaservices,flightbooking,travelbusiness,tourismpackages,honeymoonpackage,pilgrimtours,touroperator,travelplanner",
         "geo": "hyderabad,telangana,andhra",
+        "search_keywords": "travel agent hyderabad whatsapp,tour package booking hyderabad,visa consultant hyderabad contact,honeymoon package andhra",
     },
     "beauty_products": {
         "label": "💄 Beauty, Hair & Body Care",
-        "niche": "beauty products, hair care, body care, skincare, herbal beauty",
-        "hashtags": "hyderabadskincare,naturalskincare,organicbeauty,handmadesoap,haircare,bodycare,beautyproducts,herbalskincare,naturalbeauty,skincareroutine,hairgrowth,organicskincare",
+        "niche": "homemade beauty products, herbal skincare, natural hair oil, organic face cream, handmade body care",
+        "hashtags": "homemadebeauty,naturalbeautyproducts,herbalskincare,organicbeauty,handmadecosmetics,naturalfacepack,hairgrowthproducts,herbalbeauty,organicskincare,naturalhaircare,homemadeskincare,herbalcosmetics",
         "geo": "hyderabad,telangana,andhra",
+        "search_keywords": "homemade beauty products order hyderabad,herbal hair oil order online andhra,organic skincare whatsapp order",
     },
     "cakes_bakers": {
         "label": "🎂 Cakes & Dessert Bakers",
-        "niche": "custom cakes, home baker, desserts, cupcakes, birthday cakes",
-        "hashtags": "hyderabadbaker,customcakes,homebaker,cakedesign,birthdaycake,weddingcake,designercakes,fondantcakes,bakery,desserts,cupcakes,hyderabadcakes,chocolatecakes",
-        "geo": "hyderabad,telangana,andhra",
+        "niche": "custom cakes home baker, birthday cake delivery, fondant cake orders, cupcakes order, homemade desserts",
+        "hashtags": "homebaker,homebakery,customcakeorders,birthdaycakedelivery,cakeorders,cakeorder,fondantcakeorders,homemadecakes,cakebusiness,customcakes,designercakeorders,cakedelivery,homebakerbusiness",
+        "geo": "hyderabad,secunderabad,telangana",
+        "search_keywords": "custom cake order hyderabad whatsapp,home baker birthday cake hyderabad,cake delivery hyderabad order,fondant cake hyderabad",
     },
     "gift_shops": {
         "label": "🎁 Personalised Gift Shops",
-        "niche": "personalised gifts, custom gifts, gifting, engraved gifts",
-        "hashtags": "personalisedgifts,customgifts,giftshop,uniquegifts,gifting,customizedgifts,corporategifts,handmadegifts,specialgifts,birthdaygifts,weddingfavors",
-        "geo": "hyderabad,telangana,andhra",
+        "niche": "personalised gifts, custom engraved gifts, photo gifts, customized gifting, corporate gifts order",
+        "hashtags": "personalisedgifts,customgifts,giftbusiness,customizedgifts,personalisedgiftshop,giftorders,handmadegifts,photogifts,uniquegifts,corporategifts,customgiftshop,specialgifts",
+        "geo": "hyderabad,telangana",
+        "search_keywords": "personalised gift order hyderabad whatsapp,custom photo gift hyderabad,engraved gifts order online andhra",
     },
     "event_planners": {
         "label": "🎪 Event Planners & Decorators",
-        "niche": "event planner, wedding decorator, party decoration, event management",
-        "hashtags": "hyderabadevents,eventplanner,weddingdecor,partydecoration,eventmanagement,weddingevents,babyshower,housewarming,birthdayparty,eventdecor,weddingplanner",
-        "geo": "hyderabad,telangana,andhra",
+        "niche": "birthday decoration, wedding decoration, event planning, balloon decoration, party setup home",
+        "hashtags": "birthdaydecoration,eventdecorator,weddingdecor,partydecoration,balloondecoration,eventplanner,birthdaysetup,homepartysetup,weddingplanner,partyorganizer,eventmanagement,decorationbusiness",
+        "geo": "hyderabad,secunderabad,telangana",
+        "search_keywords": "birthday decoration hyderabad whatsapp,event decorator hyderabad order,wedding decoration hyderabad contact,balloon decoration hyderabad",
     },
     "home_interior": {
         "label": "🏠 Home Interior & Furniture",
-        "niche": "home interior, furniture design, home decor, interior designer",
-        "hashtags": "hyderabadinterior,homeinterior,furnituredesign,homedecor,interiordesign,homefurnishing,customfurniture,interiordecor,moderninterior,homedesign,officefurniture",
-        "geo": "hyderabad,telangana,andhra",
+        "niche": "home interior designer, custom furniture, home decor, interior decoration service, furniture maker",
+        "hashtags": "homeinteriordesign,customfurniture,homedecorbusiness,interiordecorator,furnituremaker,interiordesignbusiness,homedecorseller,customhomedecor,handmadefurniture,homedecorations",
+        "geo": "hyderabad,secunderabad,telangana",
+        "search_keywords": "interior designer hyderabad whatsapp,custom furniture hyderabad order,home decor seller hyderabad contact",
     },
     "dairy_products": {
         "label": "🥛 Homemade Dairy Products",
-        "niche": "homemade dairy, ghee, paneer, curd, butter, milk products",
-        "hashtags": "homemadeghee,desi ghee,pureghee,homemadepaneer,dairyproducts,freshpaneer,homemadebutter,organicghee,hyderabadfarm,farmproducts,puremilk",
+        "niche": "homemade ghee, fresh paneer, desi butter, curd, milk products home delivery, farm fresh dairy",
+        "hashtags": "homemadeghee,desighee,pureghee,cowghee,homemadepaneer,freshpaneer,farmfreshdairy,homemadebutterr,homemadecurd,dairyproducts,farmfreshproducts,puredairy,gheeorders",
         "geo": "hyderabad,telangana,andhra",
+        "search_keywords": "homemade ghee order hyderabad whatsapp,fresh paneer home delivery hyderabad,farm fresh dairy andhra order,desi ghee order online",
     },
     "homemade_cosmetics": {
         "label": "🧴 Homemade Cosmetics & Soaps",
-        "niche": "handmade soaps, homemade cosmetics, natural shampoo, herbal products",
-        "hashtags": "handmadesoap,naturalsoap,organicsoap,homemadecosmetics,herbalshampo,naturalshampoo,herbalcosmetics,diybeauty,chemicalfree,naturalproducts,handcraftedsoap",
+        "niche": "handmade soap, herbal shampoo, natural cosmetics, chemical free beauty, homemade body care products",
+        "hashtags": "handmadesoap,naturalsoap,handmadesoaps,herbalshampoobusiness,naturalsoapmaker,organicsoapmaker,chemicalfreeproducts,handcraftedsoap,naturalbodycare,homemadecosmetics,soapbusiness,naturalshampoo",
         "geo": "hyderabad,telangana,andhra",
+        "search_keywords": "handmade soap order hyderabad whatsapp,herbal shampoo order online andhra,natural cosmetics home delivery hyderabad",
     },
     "therapists": {
         "label": "🩺 Therapists & Online Doctors",
-        "niche": "online doctor, therapist, dietician, health consultant, wellness",
-        "hashtags": "onlinedoctor,therapist,mentalhealth,dietician,nutritionist,healthcoach,wellnesscoach,onlineconsultation,psychologist,lifecoach,healthconsultant",
+        "niche": "online consultation doctor, dietician online, mental health therapist, wellness coach, health advisor",
+        "hashtags": "onlineconsultation,dieticianconsultation,nutritionistreels,onlinehealthcoach,mentalHealthcoach,therapistonline,wellnesscoachonline,healthadvisor,onlinedietician,lifecoachonline,nutritionistindia",
         "geo": "hyderabad,telangana,andhra,india",
+        "search_keywords": "online dietician whatsapp consultation,therapist online booking india,wellness coach hyderabad contact,health coach andhra whatsapp",
     },
     "fitness_trainers": {
         "label": "💪 Gym Trainers, MUA & Dieticians",
-        "niche": "personal trainer, makeup artist, dietician, fitness coach, gym",
-        "hashtags": "personaltrainer,makeupartist,gymtrainer,fitnesscoach,dietician,nutritionist,mua,makeupindia,hyderabadmakeup,fitnessmotivation,gymmotivation,makeupbride",
-        "geo": "hyderabad,telangana,andhra",
+        "niche": "personal trainer online, makeup artist booking, bridal makeup, fitness coach, gym trainer home",
+        "hashtags": "personaltrainerindia,makeupartistbooking,bridalmakeup,makeupbooking,fitnesstrainer,gymtrainer,makeuporders,bridalmakeupartist,homegymtrainer,makeupbusiness,fitnessbusiness",
+        "geo": "hyderabad,secunderabad,telangana",
+        "search_keywords": "makeup artist hyderabad whatsapp booking,personal trainer hyderabad contact,bridal makeup hyderabad order,gym trainer home hyderabad",
     },
 }
 
@@ -411,115 +430,331 @@ _GEMINI_EMPTY = {
     "gemini_ran": False,
 }
 
+def _sanitize_for_prompt(text: str, max_len: int = 600) -> str:
+    """
+    Clean text before embedding in the Gemini prompt.
+    Removes / replaces characters that corrupt JSON output.
+    """
+    if not text:
+        return ""
+    # Truncate first
+    text = text[:max_len]
+    # Replace actual newlines with space (they break JSON string values)
+    text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    # Remove or replace characters that break JSON strings inside Gemini's output
+    text = text.replace("\\", "/")   # backslash → forward slash
+    text = text.replace('"', "'")    # double-quote → single-quote
+    # Collapse multiple spaces
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
+
+
 def gemini_parse_profile(profile: dict, niche: str, extra_text: str = "") -> dict:
     """
-    Single Gemini call per profile that does everything:
-      - Data extraction: city, state, phone/WA number, products, ordering method, languages
-      - Classification: business type, category, is_influencer, is_large_brand
-      - Qualification: sells on WA, niche match, confidence, validity
-    Returns a rich dict. Falls back gracefully if no API key or on error.
+    Single Gemini call per profile — extracts WA number, city, category,
+    products, business type, and qualifies the lead all in one shot.
     """
     if not GEMINI_KEY:
         return {**_GEMINI_EMPTY, "reason": "No Gemini API key configured", "gemini_ran": False}
 
     username  = profile.get("username", "")
-    full_name = profile.get("full_name", "")
+    full_name = _sanitize_for_prompt(profile.get("full_name", ""), 80)
     followers = profile.get("followers", 0)
     following = profile.get("following", 0)
-    bio       = profile.get("bio", "")
-    url       = profile.get("external_url", "")
-    ig_cat    = profile.get("ig_category", "")
+    bio       = _sanitize_for_prompt(profile.get("bio", ""), 500)
+    url       = _sanitize_for_prompt(profile.get("external_url", ""), 120)
+    ig_cat    = _sanitize_for_prompt(profile.get("ig_category", ""), 60)
     is_biz    = profile.get("is_business", False)
     post_cnt  = profile.get("post_count", 0)
+    extra     = _sanitize_for_prompt(extra_text, 600)
 
-    prompt = f"""You are a data extraction and lead qualification AI for a WhatsApp business outreach tool targeting small Indian businesses.
+    # ── Use a two-message structure: system context + user data ───────────────
+    # Separating data from the JSON schema prevents bio content from
+    # corrupting Gemini's JSON template output.
+    system_prompt = f"""You are a data extraction AI for a WhatsApp business outreach tool targeting small Indian businesses.
 
-Your job is to FULLY parse this Instagram profile and return a structured JSON object with every field filled as accurately as possible.
+TARGET NICHE: {niche}
 
-=== PROFILE DATA ===
-Username:       @{username}
-Display name:   {full_name}
-Followers:      {followers:,}
-Following:      {following:,}
-Posts:          {post_cnt}
-IG Category:    {ig_cat or 'not set'}
-Is Business:    {is_biz}
-Bio:
-{bio}
-
-External URL:   {url or 'none'}
-Bio-link page content (if bio links to linktree/beacons/etc):
-{extra_text[:800] if extra_text else 'none'}
-
-=== TARGET NICHE ===
-{niche}
-
-=== INSTRUCTIONS ===
-Return ONLY a valid JSON object with exactly these fields (no markdown, no extra text):
+Analyze the Instagram profile provided and return ONLY a valid JSON object with these exact fields:
 
 {{
-  "valid": <true if this is a genuine lead for the niche, false otherwise>,
-  "confidence": <"high" | "medium" | "low">,
-
-  "city": "<city extracted from bio/name/url — just the city name, e.g. Hyderabad>",
-  "state": "<Indian state, e.g. Telangana, Andhra Pradesh — infer from city if not explicit>",
-  "country": "<country, default India>",
-
-  "whatsapp_number": "<full phone number with country code if found, e.g. +919876543210 — check bio, wa.me links, bio-link page. Empty string if not found>",
-  "whatsapp_signal": <true if any WhatsApp contact signal found — number, wa.me link, 'order on WA', 'DM to order', etc.>,
-
-  "category": "<specific business category, e.g. Homemade Sweets, Fish Export, Travel Agent, Beauty Products, Custom Cakes, Gift Shop, Event Decorator, Interior Designer, Dairy Products, Handmade Soaps, Online Therapist, Personal Trainer>",
-  "business_type": "<one of: product_seller | service_provider | both | influencer | brand | unknown>",
-
-  "sells_on_whatsapp": <true if they primarily take orders or inquiries via WhatsApp>,
-  "is_small_business": <true if this is a small/micro business run by an individual or small team>,
-  "is_large_brand": <true if this appears to be a large brand, chain, franchise, or corporate>,
-  "is_influencer": <true if this is primarily a content creator / influencer with no clear product/service>,
-
-  "ordering_method": "<how customers order — e.g. WhatsApp, DM, website, phone, in-store, unknown>",
-  "products_or_services": "<brief comma-separated list of what they sell, e.g. 'avakaya pickle, gongura pickle, homemade chutneys'>",
-  "languages": "<detected language(s) in bio, e.g. English, Telugu, Hindi>",
-
-  "reason": "<one clear sentence explaining why valid is true or false>"
+  "valid": true/false,
+  "confidence": "high" or "medium" or "low",
+  "city": "city name or empty string",
+  "state": "Indian state or empty string",
+  "country": "country name, default India",
+  "whatsapp_number": "full number like +919876543210 or empty string",
+  "whatsapp_signal": true/false,
+  "category": "specific category like Homemade Sweets or Custom Cakes",
+  "business_type": "product_seller or service_provider or both or influencer or brand or unknown",
+  "sells_on_whatsapp": true/false,
+  "is_small_business": true/false,
+  "is_large_brand": true/false,
+  "is_influencer": true/false,
+  "ordering_method": "WhatsApp or DM or website or phone or unknown",
+  "products_or_services": "comma-separated list",
+  "languages": "language names",
+  "reason": "one sentence"
 }}
 
-=== EXTRACTION RULES ===
-- whatsapp_number: scan the ENTIRE bio and bio-link content for wa.me/XXXXXXXXXX links or Indian mobile numbers (10 digits starting with 6-9, or with +91 prefix). Format as +91XXXXXXXXXX.
-- city: look for 📍 pin emoji, "based in", "located in", city names, area names. Indian cities only.
-- state: infer from city (e.g. Hyderabad → Telangana, Chennai → Tamil Nadu, Mumbai → Maharashtra).
-- is_influencer: true ONLY if they have no product/service to sell — pure content, reels, memes, fashion blogging with no own product.
-- is_large_brand: true if followers > 200000 OR bio contains corporate signals (pvt ltd, llp, franchise, pan india, official page).
-- valid: true ONLY if (a) niche matches AND (b) whatsapp_signal is true AND (c) is_small_business is true AND (d) NOT is_influencer.
-- confidence: high = WA number found + clear niche match; medium = WA signal (no number) + probable match; low = weak signals."""
+RULES:
+- valid=true only if niche matches AND whatsapp_signal=true AND is_small_business=true AND is_influencer=false
+- whatsapp_number: find wa.me links or 10-digit Indian numbers starting 6-9, format as +91XXXXXXXXXX
+- city: extract from bio text, pin emoji location, or area name mentions
+- state: infer from city if not stated
+- is_large_brand: true if followers > 200000 or bio has pvt ltd/llp/franchise/pan india/official page
+- confidence: high=WA number found + clear niche, medium=WA signal + probable niche, low=weak
+- Return ONLY the JSON, no markdown, no explanation"""
 
-    try:
+    user_message = f"""Username: @{username}
+Name: {full_name}
+Followers: {followers:,} | Following: {following:,} | Posts: {post_cnt}
+IG Category: {ig_cat or 'not set'} | Is Business Account: {is_biz}
+Bio: {bio}
+External URL: {url or 'none'}
+Bio-link content: {extra or 'none'}"""
+
+    def _call_gemini(contents, use_json_mime=True):
+        payload = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 2048,   # was 600 — responses were getting truncated at ~15 tokens
+            },
+        }
+        if use_json_mime:
+            payload["generationConfig"]["responseMimeType"] = "application/json"
         resp = requests.post(
             GEMINI_URL,
             params={"key": GEMINI_KEY},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 400,
-                    "responseMimeType": "application/json",
-                },
-            },
-            timeout=20,
+            json=payload,
+            timeout=30,
         )
         resp.raise_for_status()
-        raw  = resp.json()
-        text = raw["candidates"][0]["content"]["parts"][0]["text"].strip()
-        text = re.sub(r"^```json\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-        parsed = json.loads(text)
+        return resp.json()
+
+    def _normalise_confidence(val) -> str:
+        """Convert any confidence value Gemini returns into high/medium/low."""
+        if isinstance(val, str):
+            v = val.lower().strip()
+            if v in ("high", "medium", "low", "n/a"):
+                return v
+            # Gemini sometimes returns "High", "Medium", "Low"
+            for s in ("high", "medium", "low"):
+                if s in v:
+                    return s
+            return "low"
+        if isinstance(val, (int, float)):
+            # Gemini returns 0–1 or 0–100 scale
+            f = float(val)
+            if f > 1:
+                f = f / 100.0   # normalise 0–100 → 0–1
+            if f >= 0.7:  return "high"
+            if f >= 0.4:  return "medium"
+            return "low"
+        return "low"
+
+    def _extract_json(raw_text: str) -> dict | None:
+        """Try multiple strategies to extract valid JSON from Gemini's response."""
+        text = raw_text.strip()
+
+        # Detect obviously truncated responses (< 100 chars is always incomplete)
+        if len(text) < 80:
+            log.debug(f"Response too short ({len(text)} chars) — definitely truncated")
+            return None
+
+        # Strip markdown fences
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```\s*$", "", text)
+        text = text.strip()
+
+        # Strategy 1: direct parse
+        try:
+            result = json.loads(text)
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 2: find the outermost {...} block
+        start = text.find("{")
+        end   = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                result = json.loads(text[start:end + 1])
+                if isinstance(result, dict):
+                    return result
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 3: truncated JSON — try to close open braces/brackets
+        if start != -1:
+            candidate = text[start:]
+            opens  = candidate.count("{")
+            closes = candidate.count("}")
+            if opens > closes:
+                candidate += "}" * (opens - closes)
+            try:
+                result = json.loads(candidate)
+                if isinstance(result, dict):
+                    return result
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 4: field-by-field regex extraction (last resort — works even on truncated JSON)
+        result = {}
+        bool_fields = {
+            "valid": False, "whatsapp_signal": False, "sells_on_whatsapp": False,
+            "is_small_business": True, "is_large_brand": False, "is_influencer": False,
+        }
+        str_fields = {
+            "city": "", "state": "", "country": "India",
+            "whatsapp_number": "", "category": "", "business_type": "unknown",
+            "ordering_method": "unknown", "products_or_services": "", "languages": "", "reason": "",
+        }
+        found_any = False
+        for field, default in bool_fields.items():
+            m = re.search(rf'"{field}"\s*:\s*(true|false)', text, re.I)
+            if m:
+                result[field] = m.group(1).lower() == "true"
+                found_any = True
+            else:
+                result[field] = default
+        for field, default in str_fields.items():
+            m = re.search(rf'"{field}"\s*:\s*"([^"]*)"', text)
+            if m:
+                result[field] = m.group(1)
+                found_any = True
+            else:
+                result[field] = default
+        # confidence separately — handle numeric
+        cm = re.search(r'"confidence"\s*:\s*([^\s,}]+)', text)
+        if cm:
+            raw_conf = cm.group(1).strip().strip('"')
+            result["confidence"] = _normalise_confidence(raw_conf)
+            found_any = True
+        else:
+            result["confidence"] = "low"
+
+        if found_any:
+            return result
+        return None
+
+    def _get_raw_text(raw_response: dict) -> str:
+        """Safely extract text from Gemini response, with full debug logging on failure."""
+        try:
+            candidates = raw_response.get("candidates", [])
+            if not candidates:
+                # Log the full response so we can see what went wrong
+                log.warning(f"Gemini @{username}: no candidates in response. Full response: {json.dumps(raw_response)[:500]}")
+                return ""
+            candidate = candidates[0]
+            # Check for finish reason issues
+            finish_reason = candidate.get("finishReason", "")
+            if finish_reason not in ("STOP", "MAX_TOKENS", ""):
+                log.warning(f"Gemini @{username}: finishReason={finish_reason}. Full candidate: {json.dumps(candidate)[:300]}")
+            content = candidate.get("content", {})
+            parts   = content.get("parts", [])
+            if not parts:
+                log.warning(f"Gemini @{username}: empty parts. Full candidate: {json.dumps(candidate)[:300]}")
+                return ""
+            return parts[0].get("text", "")
+        except Exception as e:
+            log.warning(f"Gemini @{username}: error extracting text: {e}. Raw: {json.dumps(raw_response)[:300]}")
+            return ""
+
+    try:
+        # ── Attempt 1: system_instruction + user message ──────────────────────
+        payload1 = {
+            "system_instruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 2048,
+                "responseMimeType": "application/json",
+            },
+        }
+        resp1 = requests.post(
+            GEMINI_URL, params={"key": GEMINI_KEY}, json=payload1, timeout=30
+        )
+        resp1.raise_for_status()
+        raw1   = resp1.json()
+        text1  = _get_raw_text(raw1)
+        log.debug(f"Gemini @{username} attempt1 raw ({len(text1)}ch): {text1[:120]}")
+        parsed = _extract_json(text1) if text1 else None
+
+        if not parsed:
+            # Short delay before retry — avoids hammering a rate-limited API
+            time.sleep(0.5)
+
+            # ── Attempt 2: plain single-message, no JSON mime ─────────────────
+            simple_prompt = (
+                f"Analyze this Instagram profile for the niche: {niche}\n\n"
+                f"Username: @{username} | Followers: {followers:,}\n"
+                f"Bio: {bio[:300]}\n"
+                f"URL: {url or 'none'}\n\n"
+                f"Return ONLY a complete JSON object with ALL of these keys (no truncation, no markdown):\n"
+                f"valid(bool), confidence(\"high\"|\"medium\"|\"low\"), city(str), state(str), "
+                f"country(str), whatsapp_number(str), whatsapp_signal(bool), category(str), "
+                f"business_type(str), sells_on_whatsapp(bool), is_small_business(bool), "
+                f"is_large_brand(bool), is_influencer(bool), ordering_method(str), "
+                f"products_or_services(str), languages(str), reason(str)\n\n"
+                f"Rules: valid=true only if niche matches AND whatsapp_signal=true AND "
+                f"is_small_business=true. confidence must be the string 'high', 'medium' or 'low'."
+            )
+            resp2 = requests.post(
+                GEMINI_URL,
+                params={"key": GEMINI_KEY},
+                json={
+                    "contents": [{"role": "user", "parts": [{"text": simple_prompt}]}],
+                    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
+                },
+                timeout=30,
+            )
+            resp2.raise_for_status()
+            raw2   = resp2.json()
+            text2  = _get_raw_text(raw2)
+            log.debug(f"Gemini @{username} attempt2 raw ({len(text2)}ch): {text2[:120]}")
+            parsed = _extract_json(text2) if text2 else None
+
+        if not parsed:
+            log.warning(
+                f"Gemini @{username}: JSON parse failed both attempts. "
+                f"attempt1={repr(text1[:120])} | "
+                f"attempt2={repr(locals().get('text2','N/A')[:120])}"
+            )
+            return {**_GEMINI_EMPTY, "reason": "JSON parse failed", "gemini_ran": False}
+
         parsed["gemini_ran"] = True
-        # Normalise types in case Gemini returns strings for bools
-        for bfield in ("valid","whatsapp_signal","sells_on_whatsapp","is_small_business",
-                       "is_large_brand","is_influencer"):
-            if bfield in parsed and isinstance(parsed[bfield], str):
-                parsed[bfield] = parsed[bfield].lower() == "true"
-        log.info(f"Gemini @{username}: valid={parsed.get('valid')} conf={parsed.get('confidence')} wa={parsed.get('whatsapp_number') or 'none'} city={parsed.get('city') or 'none'}")
+
+        # Normalise confidence — Gemini ignores our "string only" rule sometimes
+        parsed["confidence"] = _normalise_confidence(parsed.get("confidence", "low"))
+
+        # Normalise bool fields
+        for bfield in ("valid", "whatsapp_signal", "sells_on_whatsapp",
+                       "is_small_business", "is_large_brand", "is_influencer"):
+            v = parsed.get(bfield)
+            if isinstance(v, str):
+                parsed[bfield] = v.lower() == "true"
+            elif not isinstance(v, bool):
+                parsed[bfield] = bool(v)
+
+        # Normalise null → empty string for string fields
+        for sfield in ("city", "state", "country", "whatsapp_number", "category",
+                       "business_type", "ordering_method", "products_or_services",
+                       "languages", "reason"):
+            if parsed.get(sfield) is None:
+                parsed[sfield] = ""
+
+        log.info(
+            f"Gemini @{username}: valid={parsed.get('valid')} "
+            f"conf={parsed.get('confidence')} "
+            f"wa={'✓ ' + parsed['whatsapp_number'] if parsed.get('whatsapp_number') else str(parsed.get('whatsapp_signal'))} "
+            f"city={parsed.get('city') or '—'} | "
+            f"bio_given={repr(bio[:80])}"
+        )
         return parsed
+
     except Exception as e:
         log.warning(f"Gemini failed for @{username}: {e}")
         return {**_GEMINI_EMPTY, "reason": f"Gemini error: {e}", "gemini_ran": False}
@@ -712,7 +947,22 @@ def _extract_user_from_html(content: str, username: str) -> dict | None:
                 else: foll = int(raw)
             except Exception: pass
         bio_part = re.sub(r'^.*?Posts\s*[-–]\s*', '', desc, flags=re.S).strip()
-        log.info(f"@{username}: meta-tag fallback — {foll:,} followers")
+
+        # Supplement the truncated meta bio by scanning page body for WA/phone signals
+        # These appear in the raw HTML even when the full bio isn't embedded as JSON
+        extra_signals = []
+        for pat in [
+            r'wa\.me/(\d{10,13})',
+            r'whatsapp\.com/send\?phone=(\d{10,13})',
+            r'\+91[\s\-]?[6-9]\d{9}',
+            r'[6-9]\d{9}',
+        ]:
+            found = re.findall(pat, content[:50000])
+            extra_signals.extend(found[:3])
+        if extra_signals:
+            bio_part = bio_part + " WA:" + "/".join(extra_signals[:2])
+
+        log.info(f"@{username}: meta-tag fallback — {foll:,} followers | bio: {repr(bio_part[:80])}")
         return {
             "username":     username,
             "full_name":    name_m.group(1).split(" (@")[0].strip(),
@@ -820,15 +1070,16 @@ def build_search_queries(niche: str, geo_filter: str, explicit: list[str]) -> li
 def score_profile_with_gemini(profile: dict, gem: dict, geo_filter: str,
                               min_followers: int, max_followers: int) -> tuple[int, list[str], list[str]]:
     """
-    Tier a profile using Gemini-enriched data instead of regex signals.
-    Tier 1 — hot : follower range ✓ | small biz ✓ | WA signal ✓ | niche valid ✓ | geo ✓ (or no geo set)
-    Tier 2 — partial : follower range ✓ | WA signal ✓ | niche valid ✓ | geo fails
-    Tier 3 — weak : follower range ✓ | no WA signal OR low confidence | not disqualified
-    Tier 4 — out : follower range ✗ | large brand | influencer | is_verified
+    Tier a profile using Gemini-enriched data.
+
+    Tier 1 — HOT      : small biz ✓ | WA signal ✓ | niche match ✓ | geo ✓ or India-only + no geo info
+    Tier 2 — PARTIAL  : WA signal ✓ | niche match ✓ | geo fails (might still be local)
+    Tier 3 — WEAK     : in range but no WA signal, OR WA but niche mismatch
+    Tier 4 — OUT      : large brand | influencer | verified | follower count clearly wrong
     """
     followers  = profile.get("followers", 0)
     verified   = profile.get("is_verified", False)
-    # 0 = meta-tag fallback (follower count unknown) — don't disqualify on range
+    # followers==0 means meta-tag fallback (unknown count) — don't disqualify
     in_range   = (followers == 0) or (min_followers <= followers <= max_followers)
     large      = gem.get("is_large_brand", False) or (followers > max_followers and followers > 0)
     influencer = gem.get("is_influencer", False)
@@ -851,39 +1102,79 @@ def score_profile_with_gemini(profile: dict, gem: dict, geo_filter: str,
     if not in_range or verified or large or influencer:
         return 4, met, missing
 
-    # WA signal from Gemini
+    # ── WA signal: Gemini AI + regex fallback ─────────────────────────────────
     wa = gem.get("whatsapp_signal", False) or bool(gem.get("whatsapp_number", ""))
-    valid = gem.get("valid", False)
-    conf  = gem.get("confidence", "low")
-
+    if not wa:
+        # Regex fallback — Gemini sometimes misses informal WA signals
+        bio = profile.get("bio", "")
+        wa  = has_wa_signal(bio, profile.get("external_url", ""), "")
     if wa:
         wa_num = gem.get("whatsapp_number", "")
         met.append(f"WA signal{' — ' + wa_num if wa_num else ''}")
     else:
-        missing.append("No WhatsApp signal found by AI")
+        missing.append("No WhatsApp signal")
 
-    if valid:
+    # ── Niche match: from Gemini ───────────────────────────────────────────────
+    # Use gem['valid'] as a guide but don't let it alone kill a lead.
+    # A profile with WA signal that Gemini scored low-confidence is still worth seeing.
+    niche_match = gem.get("valid", False)
+    conf        = gem.get("confidence", "low")
+    if niche_match:
         met.append(f"Niche match ({conf} confidence)")
     else:
-        missing.append(f"Niche mismatch: {gem.get('reason','')[:60]}")
+        missing.append(f"Possible niche mismatch: {gem.get('reason','')[:80]}")
 
-    # Geo check — use AI-extracted city/state first, fall back to regex
-    geo_ok = True
+    # ── Geo check ─────────────────────────────────────────────────────────────
+    # Logic: if geo_filter is set, check AI city/state + bio text.
+    # But: many small Indian home businesses don't mention city at all.
+    # If Gemini says country=India and no city found → call it "geo-unknown"
+    # rather than "geo-failed", and still allow tier-1 if everything else fits.
+    geo_ok      = True   # default: pass if no filter set
+    geo_unknown = False  # city not in bio but seems Indian
     if geo_filter:
-        ai_loc = f"{gem.get('city','')} {gem.get('state','')}".lower()
-        bio_text = f"{profile.get('bio','')} {profile.get('full_name','')} {profile.get('username','')}".lower()
-        combined_loc = f"{ai_loc} {bio_text}"
-        geo_ok = any(w.strip() in combined_loc for w in geo_filter.lower().split(",") if w.strip())
-        if geo_ok:
+        ai_city    = (gem.get("city", "") or "").lower()
+        ai_state   = (gem.get("state", "") or "").lower()
+        ai_country = (gem.get("country", "") or "").lower()
+        bio_text   = f"{profile.get('bio','')} {profile.get('full_name','')} {profile.get('username','')}".lower()
+        combined   = f"{ai_city} {ai_state} {bio_text}"
+
+        filter_words = [w.strip().lower() for w in geo_filter.split(",") if w.strip()]
+        geo_ok = any(w in combined for w in filter_words)
+
+        if not geo_ok:
+            # If country is India and no geo info at all, treat as "unknown" not "failed"
+            is_india = ai_country in ("india", "") or any(
+                w in combined for w in ["india", "indian", "भारत", "🇮🇳"]
+            )
+            no_foreign_city = not any(
+                w in combined for w in [
+                    "london", "dubai", "usa", "uk", "canada", "australia",
+                    "singapore", "malaysia", "usa", "new york", "california",
+                ]
+            )
+            if is_india and no_foreign_city and not ai_city:
+                geo_unknown = True   # Indian but city not in bio
+            if geo_ok:
+                loc_label = gem.get("city") or gem.get("state") or geo_filter
+                met.append(f"Geo match — {loc_label}")
+            elif geo_unknown:
+                met.append("Geo: India (city not in bio — could be local)")
+            else:
+                missing.append(f"Geo mismatch — AI detected: {ai_city or ai_state or 'unknown'}")
+        else:
             loc_label = gem.get("city") or gem.get("state") or geo_filter
             met.append(f"Geo match — {loc_label}")
-        else:
-            missing.append(f"No geo match for '{geo_filter}'")
 
-    if wa and valid and geo_ok:
+    # ── Final tiering ──────────────────────────────────────────────────────────
+    # Tier 1: WA + niche match + (geo confirmed OR geo unknown-but-India)
+    # Tier 2: WA + niche match + geo clearly somewhere else
+    # Tier 3: WA but niche weak, OR no WA but niche match
+    if wa and niche_match and (geo_ok or geo_unknown):
         return 1, met, missing
-    if wa and valid and not geo_ok:
+    if wa and niche_match and not geo_ok and not geo_unknown:
         return 2, met, missing
+    if wa and not niche_match:
+        return 2, met, missing   # has WA, wrong niche — still worth a look
     return 3, met, missing
 
 
@@ -1003,8 +1294,9 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
         gem = gemini_parse_profile(prof, niche, extra)
         return uname, prof, extra, gem
 
-    # Use 8 workers — Gemini 2.5 Flash handles concurrent requests well
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    # 3 workers — Gemini free tier rate-limits hard under concurrent load,
+    # causing response truncation. Sequential-ish is much more reliable.
+    with ThreadPoolExecutor(max_workers=3) as ex:
         futs = {ex.submit(_parse_one, item): item for item in all_profiles.items()}
         for fut in as_completed(futs):
             uname, prof, extra, gem = fut.result()

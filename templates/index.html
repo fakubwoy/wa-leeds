@@ -357,12 +357,12 @@ tr.tier-row.t4 { border-left-color: #5a607540; opacity: 0.65; }
       </div>
       <div style="flex:1">
         <div class="section-label">Min followers</div>
-        <input type="number" id="min_followers" value="10000" min="0" step="100">
+        <input type="number" id="min_followers" value="1000" min="0" step="100">
       </div>
     </div>
     <div>
       <div class="section-label">Max followers</div>
-      <input type="number" id="max_followers" value="500000" min="0" step="1000">
+      <input type="number" id="max_followers" value="200000" min="0" step="1000">
     </div>
 
     <div class="stats-grid">
@@ -643,9 +643,10 @@ function selectPreset(key) {
   });
   const p = allPresets[key];
   if (!p) return;
-  document.getElementById('niche').value        = p.niche;
-  document.getElementById('hashtags').value     = p.hashtags;
-  document.getElementById('geo_filter').value   = p.geo || '';
+  document.getElementById('niche').value          = p.niche;
+  document.getElementById('hashtags').value       = p.hashtags;
+  document.getElementById('geo_filter').value     = p.geo || '';
+  document.getElementById('search_keywords').value = p.search_keywords || '';
 }
 
 loadPresets();
