@@ -22,7 +22,7 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5
 MIN_FOLLOWERS = 1_000
 MAX_FOLLOWERS = 200_000
 
-WA_LINK_RE = re.compile(r"wa\.me/(\d+)|whatsapp\.com/send\?phone=(\d+)", re.I)
+WA_LINK_RE = re.compile(r"wa\.me/\+?(\d+)|whatsapp\.com/send\?phone=(\d+)", re.I)
 PHONE_RE   = re.compile(r"(?<!\d)(\+?91[\s\-]?[6-9]\d{9}|[6-9]\d{9})(?!\d)")
 WA_KW      = [
     "whatsapp", "wa.me", "wa:", "wa -", "wa no", "wa num",
@@ -305,6 +305,170 @@ def _make_context(browser):
 # Helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── DOM bio extraction JS — module-level raw string to avoid escape issues ────
+_DOM_BIO_JS = r"""() => {
+    // Parse the profile header section as structured text.
+    // Instagram's class names are randomly generated and change weekly.
+    // We use the stable page STRUCTURE instead:
+    //   header > section contains: username, name, stats, bio, links
+
+    function parseFollowers(txt) {
+        if (!txt) return 0;
+        const t = txt.trim().replace(/,/g, '');
+        const m = t.match(/^([\d.]+)([kKmM]?)$/);
+        if (!m) return 0;
+        const n = parseFloat(m[1]);
+        if (m[2].toLowerCase() === 'k') return Math.round(n * 1000);
+        if (m[2].toLowerCase() === 'm') return Math.round(n * 1000000);
+        return Math.round(n);
+    }
+
+    // Resolve an Instagram redirect link (l.instagram.com/?u=...) to the real URL
+    function resolveIgRedirect(href) {
+        try {
+            if (href.includes('l.instagram.com')) {
+                const u = new URL(href).searchParams.get('u');
+                if (u) return decodeURIComponent(u);
+            }
+        } catch(e) {}
+        return href;
+    }
+
+    // Extract wa.me URLs from any block of visible text (handles "wa.me/917011437821 and 1 more")
+    function extractWaFromText(text) {
+        const found = [];
+        // Match wa.me/+DIGITS or wa.me/DIGITS anywhere in the string
+        const re = /wa\.me\/\+?(\d+)/gi;
+        let m;
+        while ((m = re.exec(text)) !== null) {
+            const url = 'https://wa.me/' + m[1];
+            if (!found.includes(url)) found.push(url);
+        }
+        return found;
+    }
+
+    // Detect the IG internal links-page URL (instagram.com/username/links/)
+    // Instagram collapses multiple profile links into a pill showing "wa.me/... and N more"
+    // that links internally rather than to l.instagram.com. We capture it so Python
+    // can navigate to it with Playwright and scrape the real URLs.
+    function isIgLinksPage(href) {
+        return /instagram\.com\/[^/]+\/links\/?/i.test(href);
+    }
+
+    const header = document.querySelector('header') ||
+                   document.querySelector('main') ||
+                   document.querySelector('[role="main"]');
+
+    let bio = '', followers = 0, fullName = '', extUrl = '';
+    let allLinks = [];   // ALL external links found — wa.me, linktree, etc.
+    let igLinksPageUrl = ''; // IG internal /links/ page if present
+
+    if (header) {
+        // Full name: first h1 or h2 in header
+        const h = header.querySelector('h1, h2');
+        if (h) fullName = h.innerText.trim();
+
+        // Follower count: find a list item containing "followers"
+        const allLi = header.querySelectorAll('li');
+        for (const li of allLi) {
+            const txt = li.innerText || '';
+            if (/follower/i.test(txt)) {
+                const numMatch = txt.match(/([\d.,]+[kKmM]?)/);
+                if (numMatch) followers = parseFollowers(numMatch[1]);
+                break;
+            }
+        }
+
+        // ── Strategy A: scan all <a> tags in header ─────────────────────────
+        // Instagram shows profile links as <a> elements below the bio.
+        // Some go via l.instagram.com (single link), others go to an internal
+        // /links/ page (multiple links collapsed into a pill widget).
+        const linkEls = header.querySelectorAll('a[href]');
+        for (const a of linkEls) {
+            const href = a.href || '';
+            if (!href || href.includes('#')) continue;
+
+            // Capture the IG /links/ page URL — we'll navigate there in Python
+            if (isIgLinksPage(href)) {
+                igLinksPageUrl = href;
+                // Don't skip — also scan the pill text below
+            } else if (href.match(/instagram\.com\/([\w.]+)\/?$/) && !href.includes('l.instagram.com')) {
+                // Pure internal nav link (profile, explore, etc.) — skip
+                continue;
+            } else {
+                // External or l.instagram.com link — resolve and keep
+                const resolved = resolveIgRedirect(href);
+                if (resolved && !allLinks.includes(resolved)) {
+                    allLinks.push(resolved);
+                }
+            }
+
+            // Always scan the visible anchor text for wa.me patterns.
+            // The collapsed pill shows "wa.me/917011437821 and 1 more" as plain text
+            // even when the href is an internal /links/ page.
+            const linkText = (a.innerText || a.textContent || '').trim();
+            for (const waUrl of extractWaFromText(linkText)) {
+                if (!allLinks.includes(waUrl)) allLinks.push(waUrl);
+            }
+        }
+
+        // ── Strategy B: scan ALL visible text in the header for wa.me patterns ──
+        // Catches cases where the link widget is rendered as a <div>/<span> with
+        // no underlying <a> tag, or where the text is outside the anchor.
+        const headerText = header.innerText || '';
+        for (const waUrl of extractWaFromText(headerText)) {
+            if (!allLinks.includes(waUrl)) allLinks.push(waUrl);
+        }
+
+        // extUrl = first non-IG link (for backward compat), prefer wa.me links
+        const waLink = allLinks.find(l => l.includes('wa.me'));
+        extUrl = waLink || allLinks[0] || '';
+
+        // Bio: find the longest meaningful text block in the header,
+        // excluding the username, display name, stat labels/numbers,
+        // and the links widget (which is inside a <button> element).
+        const username = location.pathname.replace(/\//g, '');
+        const statWords = ['posts', 'followers', 'following'];
+
+        const candidates = header.querySelectorAll('span, div, p');
+        let bestBio = '';
+        for (const el of candidates) {
+            // Skip anything inside a <button> — that's the links widget, not bio text
+            if (el.closest('button')) continue;
+            const directText = el.innerText ? el.innerText.trim() : '';
+            if (!directText || directText.length < 3) continue;
+            if (directText === username || directText === '@' + username) continue;
+            if (fullName && directText === fullName) continue;
+            if (statWords.some(w => directText.toLowerCase() === w)) continue;
+            if (/^[\d.,]+[kKmM]?$/.test(directText)) continue;
+            if (directText.length < 5 && !/[a-zA-Z0-9]/.test(directText)) continue;
+            if (['Edit profile','Follow','Message','More','Share'].includes(directText)) continue;
+            // Skip if the text is just a wa.me URL — that's a link, not bio
+            if (/^wa\.me\//.test(directText)) continue;
+            if (directText.length > bestBio.length && directText.length > 10) {
+                bestBio = directText;
+            }
+        }
+        // Strip any trailing wa.me/... lines that leaked into the bio via a parent container
+        bio = bestBio.replace(/\s*wa\.me\/\S+(\s+and\s+\d+\s+more)?/gi, '').trim();
+    }
+
+    // Fallback: meta description (only if it contains actual bio content)
+    if (!bio) {
+        const metaDesc = document.querySelector('meta[name="description"]');
+        if (metaDesc) {
+            const d = metaDesc.content || '';
+            const stripped = d.replace(/^.*?Posts\s*[-\u2013]\s*/i, '').trim();
+            if (stripped && !stripped.startsWith('See Instagram')) {
+                bio = stripped;
+            }
+        }
+    }
+
+    return { bio, followers, fullName, extUrl, allLinks, igLinksPageUrl };
+}"""
+
+
 def extract_city(bio: str, full_name: str) -> str:
     text = f"{bio} {full_name}".lower()
     m = re.search(CITY_PATTERNS[0], text, re.I)
@@ -320,19 +484,45 @@ def extract_city(bio: str, full_name: str) -> str:
 
 
 def extract_wa_number(bio: str, extra_text: str = "") -> str:
+    """
+    Extract a WhatsApp/phone number from bio + extra text.
+    Returns a validated +91XXXXXXXXXX string (12 chars, last 10 digits start 6-9),
+    or empty string if no valid number is found.
+    """
+    def _normalise_to_e164(raw: str) -> str:
+        """Convert a raw number string to +91XXXXXXXXXX or return '' if invalid."""
+        digits = re.sub(r"[\s\-()]", "", raw)
+        # Strip leading + if present
+        if digits.startswith("+"):
+            digits = digits[1:]
+        # Strip country code 91 if present, leaving exactly 10 digits
+        if digits.startswith("91") and len(digits) == 12:
+            digits = digits[2:]
+        elif digits.startswith("091") and len(digits) == 13:
+            digits = digits[3:]
+        # Must be exactly 10 digits starting with 6-9
+        if len(digits) == 10 and digits[0] in "6789":
+            return "+91" + digits
+        return ""
+
     combined = f"{bio} {extra_text}"
+
+    # Priority 1: wa.me or whatsapp.com links — most reliable
     for m in WA_LINK_RE.finditer(combined):
-        num = (m.group(1) or m.group(2) or "").strip()
-        if len(num) >= 10:
-            return "+" + num if not num.startswith("+") else num
-    phones = PHONE_RE.findall(combined)
-    if phones:
-        num = re.sub(r"[\s\-]", "", phones[0])
-        if not num.startswith("+"):
-            num = "+91" + num.lstrip("+").lstrip("91")
-            if len(num) > 13:
-                num = "+91" + num[-10:]
-        return num
+        raw = (m.group(1) or m.group(2) or "").strip()
+        result = _normalise_to_e164(raw)
+        if result:
+            return result
+
+    # Priority 2: PHONE_RE — +91 prefixed or bare 10-digit numbers
+    # Collapse spaces/dashes between digits first so "98765 43210" matches cleanly
+    combined_collapsed = re.sub(r'(\d)[\s\-]+(\d)', r'\1\2', combined)
+    combined_collapsed = re.sub(r'(\d)[\s\-]+(\d)', r'\1\2', combined_collapsed)  # second pass for "9 8765 43210"
+    for raw in PHONE_RE.findall(combined_collapsed):
+        result = _normalise_to_e164(raw)
+        if result:
+            return result
+
     return ""
 
 
@@ -461,12 +651,27 @@ def gemini_parse_profile(profile: dict, niche: str, extra_text: str = "") -> dic
     full_name = _sanitize_for_prompt(profile.get("full_name", ""), 80)
     followers = profile.get("followers", 0)
     following = profile.get("following", 0)
-    bio       = _sanitize_for_prompt(profile.get("bio", ""), 500)
-    url       = _sanitize_for_prompt(profile.get("external_url", ""), 120)
+    bio_raw   = profile.get("bio", "")
+    url_raw   = profile.get("external_url", "") or ""
+    bio       = _sanitize_for_prompt(bio_raw, 500)
+    url       = _sanitize_for_prompt(url_raw, 120)
     ig_cat    = _sanitize_for_prompt(profile.get("ig_category", ""), 60)
     is_biz    = profile.get("is_business", False)
     post_cnt  = profile.get("post_count", 0)
     extra     = _sanitize_for_prompt(extra_text, 600)
+
+    # ── Pre-extract WA number with regex BEFORE calling Gemini ───────────────
+    # Gemini often hallucinates or corrupts phone numbers from sanitized bio text.
+    # Our regex operates on the RAW (unsanitized) bio + extra_text, which is more
+    # reliable. We inject the result as a "verified" fact so Gemini just confirms
+    # it rather than trying to extract it independently.
+    regex_wa_number = extract_wa_number(bio_raw, extra_text)
+    verified_wa_hint = (
+        f"VERIFIED WhatsApp number extracted by regex: {regex_wa_number} — "
+        f"use this exact value for whatsapp_number; set whatsapp_signal=true."
+        if regex_wa_number
+        else "No WhatsApp number found by regex pre-scan — check bio text yourself."
+    )
 
     # ── Use a two-message structure: system context + user data ───────────────
     # Separating data from the JSON schema prevents bio content from
@@ -499,7 +704,8 @@ Analyze the Instagram profile provided and return ONLY a valid JSON object with 
 
 RULES:
 - valid=true only if niche matches AND whatsapp_signal=true AND is_small_business=true AND is_influencer=false
-- whatsapp_number: find wa.me links or 10-digit Indian numbers starting 6-9, format as +91XXXXXXXXXX
+- whatsapp_number: {verified_wa_hint} If no verified number, look for wa.me links or 10-digit Indian numbers starting 6-9, format as +91XXXXXXXXXX
+- IMPORTANT: only output a whatsapp_number you are 100% certain about — never guess or invent digits
 - city: extract from bio text, pin emoji location, or area name mentions
 - state: infer from city if not stated
 - is_large_brand: true if followers > 200000 or bio has pvt ltd/llp/franchise/pan india/official page
@@ -674,10 +880,18 @@ Bio-link content: {extra or 'none'}"""
                 "responseMimeType": "application/json",
             },
         }
-        resp1 = requests.post(
-            GEMINI_URL, params={"key": GEMINI_KEY}, json=payload1, timeout=30
-        )
-        resp1.raise_for_status()
+        # Exponential backoff on 429 rate-limit — lets us run more workers safely
+        for _attempt in range(4):
+            resp1 = requests.post(
+                GEMINI_URL, params={"key": GEMINI_KEY}, json=payload1, timeout=30
+            )
+            if resp1.status_code == 429:
+                wait = (2 ** _attempt) + random.uniform(0, 1)
+                log.warning(f"Gemini @{username}: 429 rate-limit, retrying in {wait:.1f}s (attempt {_attempt+1})")
+                time.sleep(wait)
+                continue
+            resp1.raise_for_status()
+            break
         raw1   = resp1.json()
         text1  = _get_raw_text(raw1)
         log.debug(f"Gemini @{username} attempt1 raw ({len(text1)}ch): {text1[:120]}")
@@ -693,6 +907,7 @@ Bio-link content: {extra or 'none'}"""
                 f"Username: @{username} | Followers: {followers:,}\n"
                 f"Bio: {bio[:300]}\n"
                 f"URL: {url or 'none'}\n\n"
+                f"IMPORTANT — WhatsApp number: {verified_wa_hint}\n\n"
                 f"Return ONLY a complete JSON object with ALL of these keys (no truncation, no markdown):\n"
                 f"valid(bool), confidence(\"high\"|\"medium\"|\"low\"), city(str), state(str), "
                 f"country(str), whatsapp_number(str), whatsapp_signal(bool), category(str), "
@@ -700,18 +915,26 @@ Bio-link content: {extra or 'none'}"""
                 f"is_large_brand(bool), is_influencer(bool), ordering_method(str), "
                 f"products_or_services(str), languages(str), reason(str)\n\n"
                 f"Rules: valid=true only if niche matches AND whatsapp_signal=true AND "
-                f"is_small_business=true. confidence must be the string 'high', 'medium' or 'low'."
+                f"is_small_business=true. confidence must be the string 'high', 'medium' or 'low'. "
+                f"Never invent or guess a phone number — only use the verified one above if provided."
             )
-            resp2 = requests.post(
-                GEMINI_URL,
-                params={"key": GEMINI_KEY},
-                json={
-                    "contents": [{"role": "user", "parts": [{"text": simple_prompt}]}],
-                    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
-                },
-                timeout=30,
-            )
-            resp2.raise_for_status()
+            for _attempt2 in range(4):
+                resp2 = requests.post(
+                    GEMINI_URL,
+                    params={"key": GEMINI_KEY},
+                    json={
+                        "contents": [{"role": "user", "parts": [{"text": simple_prompt}]}],
+                        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
+                    },
+                    timeout=30,
+                )
+                if resp2.status_code == 429:
+                    wait = (2 ** _attempt2) + random.uniform(0, 1)
+                    log.warning(f"Gemini @{username}: 429 on attempt2, retrying in {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                resp2.raise_for_status()
+                break
             raw2   = resp2.json()
             text2  = _get_raw_text(raw2)
             log.debug(f"Gemini @{username} attempt2 raw ({len(text2)}ch): {text2[:120]}")
@@ -745,6 +968,32 @@ Bio-link content: {extra or 'none'}"""
                        "languages", "reason"):
             if parsed.get(sfield) is None:
                 parsed[sfield] = ""
+
+        # ── WA number safety net ──────────────────────────────────────────────
+        # If our regex found a number pre-scan, always prefer it over Gemini's
+        # output. Gemini may hallucinate digits or corrupt them during sanitization.
+        # If Gemini found something and regex found nothing, keep Gemini's value
+        # but only if it looks like a valid Indian mobile number.
+        gemini_wa = parsed.get("whatsapp_number", "")
+        if regex_wa_number:
+            if gemini_wa and gemini_wa != regex_wa_number:
+                log.info(
+                    f"Gemini @{username}: WA number override — "
+                    f"regex={regex_wa_number} vs gemini={gemini_wa} → using regex"
+                )
+            parsed["whatsapp_number"] = regex_wa_number
+            parsed["whatsapp_signal"] = True
+        elif gemini_wa:
+            # Validate Gemini's number looks like a real Indian mobile
+            digits = re.sub(r"[^\d]", "", gemini_wa)
+            # Indian mobiles: 10 digits starting 6-9, or with +91 prefix = 12 digits
+            if not re.match(r"^(91)?[6-9]\d{9}$", digits):
+                log.warning(
+                    f"Gemini @{username}: WA number '{gemini_wa}' failed validation "
+                    f"(digits={digits}) — clearing"
+                )
+                parsed["whatsapp_number"] = ""
+                # Don't flip whatsapp_signal — bio may still mention WA even without a valid number
 
         log.info(
             f"Gemini @{username}: valid={parsed.get('valid')} "
@@ -786,22 +1035,47 @@ def collect_usernames_from_hashtag(tag: str, limit: int) -> set[str]:
             page.on("response", on_response)
             page.goto(f"https://www.instagram.com/explore/tags/{tag}/",
                       wait_until="domcontentloaded", timeout=20_000)
+            # Initial load — wait for first XHR batch
             page.wait_for_timeout(4000)
-            for body in captured:
-                sections = (body.get("data", {}).get("recent", {}).get("sections", [])
-                            or body.get("sections", []))
-                for section in sections:
-                    for item in section.get("layout_content", {}).get("medias", []):
-                        media = item.get("media", {})
-                        uname = (media.get("user", {}).get("username", "")
-                                 or media.get("owner", {}).get("username", ""))
-                        if uname: usernames.add(uname)
+
+            def _drain_captured():
+                """Parse all captured XHR responses and add usernames."""
+                for body in captured:
+                    sections = (body.get("data", {}).get("recent", {}).get("sections", [])
+                                or body.get("sections", []))
+                    for section in sections:
+                        for item in section.get("layout_content", {}).get("medias", []):
+                            media = item.get("media", {})
+                            uname = (media.get("user", {}).get("username", "")
+                                     or media.get("owner", {}).get("username", ""))
+                            if uname: usernames.add(uname)
+                captured.clear()
+
+            # ── Scroll loop: each scroll triggers more XHR batches ───────────
+            # Instagram lazy-loads posts as you scroll. Without scrolling
+            # you only get the first ~12 posts (one grid row).
+            _drain_captured()
+            max_scrolls = max(4, (limit // 12) + 2)
+            last_count  = -1
+            for scroll_n in range(max_scrolls):
+                if len(usernames) >= limit:
+                    break
+                if len(usernames) == last_count:
+                    # No new accounts after last scroll — page is exhausted
+                    log.info(f"#{tag}: no new users after scroll {scroll_n} — stopping")
+                    break
+                last_count = len(usernames)
+                page.evaluate("window.scrollBy(0, window.innerHeight * 3)")
+                page.wait_for_timeout(random.uniform(2000, 3000))
+                _drain_captured()
+                log.debug(f"#{tag}: scroll {scroll_n+1}/{max_scrolls} → {len(usernames)} users")
+
             if not usernames:
                 log.info(f"#{tag}: XHR intercept got nothing, trying DOM scrape…")
                 usernames.update(_parse_usernames_from_content(page.content()))
         finally:
             page.close(); ctx.close()
-        log.info(f"#{tag} → {len(usernames)} usernames")
+        log.info(f"#{tag} → {len(usernames)} usernames (after scrolling)")
         return set(list(usernames)[:limit])
 
     try:
@@ -948,19 +1222,11 @@ def _extract_user_from_html(content: str, username: str) -> dict | None:
             except Exception: pass
         bio_part = re.sub(r'^.*?Posts\s*[-–]\s*', '', desc, flags=re.S).strip()
 
-        # Supplement the truncated meta bio by scanning page body for WA/phone signals
-        # These appear in the raw HTML even when the full bio isn't embedded as JSON
-        extra_signals = []
-        for pat in [
-            r'wa\.me/(\d{10,13})',
-            r'whatsapp\.com/send\?phone=(\d{10,13})',
-            r'\+91[\s\-]?[6-9]\d{9}',
-            r'[6-9]\d{9}',
-        ]:
-            found = re.findall(pat, content[:50000])
-            extra_signals.extend(found[:3])
-        if extra_signals:
-            bio_part = bio_part + " WA:" + "/".join(extra_signals[:2])
+        # Meta-tag fallback gives us follower count + a generic description only.
+        # Instagram no longer includes the actual bio in og:description.
+        # Do NOT scan page body for phone numbers here — the 50KB of HTML contains
+        # OTHER users' data (related accounts, suggested follows) which would give
+        # us wrong numbers. The real bio comes from DOM extraction (Strategy 3.5).
 
         log.info(f"@{username}: meta-tag fallback — {foll:,} followers | bio: {repr(bio_part[:80])}")
         return {
@@ -1002,7 +1268,8 @@ def fetch_profile(username: str) -> dict | None:
                         return
                     if ("web_profile_info" in url
                             or "graphql/query" in url
-                            or "/api/v1/users/" in url):
+                            or "/api/v1/users/" in url
+                            or "/api/graphql" in url):   # modern IG GraphQL endpoint
                         data = response.json()
                         captured_xhr.append(data)
                 except Exception:
@@ -1020,19 +1287,132 @@ def fetch_profile(username: str) -> dict | None:
 
             # ── Strategy 1 & 2: XHR data ──────────────────────────────────
             for body in captured_xhr:
+                # Modern /api/graphql wraps data under data.user or
+                # data.xdt_api__v1__users__web_profile_info__connection
                 user = (body.get("data", {}).get("user")
+                        or body.get("data", {}).get("xdt_api__v1__users__web_profile_info__connection", {}).get("data", {}).get("user")
                         or body.get("graphql", {}).get("user")
                         or body.get("user"))
                 if not user:
-                    # /api/v1/users/{id}/info/ format
                     user = body.get("user") or body
                 result = _normalise_user(user, username)
                 if result and result.get("followers", 0) > 0:
                     return result
 
-            # ── Strategy 3 & 4: HTML extraction ───────────────────────────
+            # ── Strategy 3: HTML script-tag + DOM bio extraction ───────────
             content = page.content()
             result  = _extract_user_from_html(content, username)
+
+            # ── Strategy 3.5: DOM bio + links extraction via Playwright ───────
+            # ALWAYS run this — even when a bio was already found via HTML/JSON.
+            # The DOM JS is the only way to get the links section (wa.me links,
+            # linktree, etc.) which is a separate widget below the bio text and
+            # is NOT present in the JSON/HTML embed or the meta tags.
+            try:
+                dom_data = page.evaluate(_DOM_BIO_JS)
+                all_links = dom_data.get("allLinks", [])
+                ig_links_page = dom_data.get("igLinksPageUrl", "")
+                dom_ext_url   = dom_data.get("extUrl", "")
+                bio_text      = dom_data.get("bio", "")
+                log.debug(
+                    f"@{username}: DOM raw → bio={repr(bio_text[:80])} "
+                    f"extUrl={repr(dom_ext_url)} allLinks={all_links} "
+                    f"igLinksPage={repr(ig_links_page)}"
+                )
+
+                # ── Strategy 3.6: navigate to IG /links/ page if present ──────
+                # When a profile has multiple links, Instagram collapses them into
+                # a pill widget ("wa.me/... and 1 more") whose <a> points to
+                # instagram.com/username/links/. Navigate there to get all URLs.
+                if ig_links_page and not all_links:
+                    try:
+                        log.debug(f"@{username}: navigating to IG links page: {ig_links_page}")
+                        page.goto(ig_links_page, wait_until="domcontentloaded", timeout=10000)
+                        page.wait_for_timeout(2000)
+                        # Scrape all <a> tags on the links page
+                        links_page_links = page.evaluate(r"""() => {
+                            const links = [];
+                            document.querySelectorAll('a[href]').forEach(a => {
+                                const href = a.href || '';
+                                if (!href || href.includes('#')) return;
+                                // Resolve l.instagram.com redirects
+                                let resolved = href;
+                                try {
+                                    if (href.includes('l.instagram.com')) {
+                                        const u = new URL(href).searchParams.get('u');
+                                        if (u) resolved = decodeURIComponent(u);
+                                    }
+                                } catch(e) {}
+                                // Skip internal IG links
+                                if (/instagram\.com\/[^/]+\/?$/.test(resolved)) return;
+                                if (!links.includes(resolved)) links.push(resolved);
+                                // Also scan anchor text for wa.me
+                                const txt = (a.innerText || '').trim();
+                                const re = /wa\.me\/\+?(\d+)/gi;
+                                let m;
+                                while ((m = re.exec(txt)) !== null) {
+                                    const wu = 'https://wa.me/' + m[1];
+                                    if (!links.includes(wu)) links.push(wu);
+                                }
+                            });
+                            // Also scan full page text for wa.me patterns
+                            const pageText = document.body ? document.body.innerText : '';
+                            const re2 = /wa\.me\/\+?(\d+)/gi;
+                            let m2;
+                            while ((m2 = re2.exec(pageText)) !== null) {
+                                const wu = 'https://wa.me/' + m2[1];
+                                if (!links.includes(wu)) links.push(wu);
+                            }
+                            return links;
+                        }""")
+                        log.debug(f"@{username}: IG links page → {links_page_links}")
+                        all_links = links_page_links or all_links
+                    except Exception as e:
+                        log.debug(f"@{username}: IG links page navigation failed: {e}")
+
+                # Append all discovered links to bio so extract_wa_number / Gemini see them
+                if all_links:
+                    links_str = " ".join(all_links)
+                    bio_text  = f"{bio_text} {links_str}".strip()
+
+                if result:
+                    # Always patch in the links data even if we already have a bio
+                    if not result.get("bio") and bio_text:
+                        result["bio"] = bio_text
+                    elif all_links:
+                        # Append links to existing bio so wa.me URLs are visible
+                        existing = result.get("bio", "")
+                        links_str = " ".join(all_links)
+                        result["bio"] = f"{existing} {links_str}".strip()
+                    if not result.get("external_url") and dom_ext_url:
+                        result["external_url"] = dom_ext_url
+                    if not result.get("followers") and dom_data.get("followers", 0):
+                        result["followers"] = dom_data["followers"]
+                    if not result.get("full_name") and dom_data.get("fullName"):
+                        result["full_name"] = dom_data["fullName"]
+                else:
+                    if bio_text or dom_data.get("followers", 0) > 0:
+                        result = {
+                            "username":     username,
+                            "full_name":    dom_data.get("fullName", ""),
+                            "followers":    dom_data.get("followers", 0),
+                            "following":    0,
+                            "post_count":   0,
+                            "bio":          bio_text,
+                            "external_url": dom_ext_url,
+                            "is_verified":  False,
+                            "is_business":  False,
+                            "ig_category":  "",
+                        }
+                log.debug(
+                    f"@{username}: after DOM merge → "
+                    f"bio_len={len((result or {}).get('bio',''))} "
+                    f"external_url={repr((result or {}).get('external_url','')[:80])} "
+                    f"wa_in_bio={bool(WA_LINK_RE.search((result or {}).get('bio','')))}"
+                )
+            except Exception as e:
+                log.debug(f"@{username}: DOM bio extract failed: {e}")
+
             return result
 
         finally:
@@ -1042,7 +1422,14 @@ def fetch_profile(username: str) -> dict | None:
     try:
         p = browser_run(_job)
         if p and p.get("followers", 0) > 0:
-            log.info(f"@{username}: {p['followers']:,} followers | bio: {len(p.get('bio',''))} chars")
+            ext_url = p.get("external_url", "")
+            wa_in_bio = bool(WA_LINK_RE.search(p.get("bio", "")))
+            wa_in_url = bool(WA_LINK_RE.search(ext_url))
+            log.info(
+                f"@{username}: {p['followers']:,} followers | bio: {len(p.get('bio',''))} chars | "
+                f"external_url={repr(ext_url[:80])} | wa_in_bio={wa_in_bio} | wa_in_url={wa_in_url}"
+            )
+            log.debug(f"@{username}: full_bio={repr(p.get('bio','')[:200])}")
         elif p:
             log.info(f"@{username}: fetched (0 followers — meta fallback)")
         else:
@@ -1276,6 +1663,17 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
         extra = ""
         if url and any(lp in url.lower() for lp in LINK_PAGES):
             extra = fetch_bio_link(url)
+        # Always include the external_url itself in extra so that wa.me links
+        # set as the profile link (e.g. wa.me/+918951787072) are passed to
+        # extract_wa_number and has_wa_signal even when the URL is not a
+        # link-in-bio page and no fetch is performed.
+        if url:
+            extra = f"{url} {extra}".strip()
+        # Log what we are actually passing to extract_wa_number / Gemini
+        regex_pre = extract_wa_number(prof.get("bio", ""), extra)
+        log.debug(
+            f"@{uname}: _parse_one — external_url={repr(url[:80])} | "            f"extra_prefix={repr(extra[:80])} | regex_wa={repr(regex_pre)}"
+        )
         if debug_mode:
             # In debug, skip Gemini but still fetch bio-link
             return uname, prof, extra, {
@@ -1294,14 +1692,31 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
         gem = gemini_parse_profile(prof, niche, extra)
         return uname, prof, extra, gem
 
-    # 3 workers — Gemini free tier rate-limits hard under concurrent load,
-    # causing response truncation. Sequential-ish is much more reliable.
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        futs = {ex.submit(_parse_one, item): item for item in all_profiles.items()}
-        for fut in as_completed(futs):
-            uname, prof, extra, gem = fut.result()
+    # ── Parallel Gemini calls with rate-limit protection ─────────────────────
+    # gemini-2.5-flash free tier: 10 RPM sustained, ~15 concurrent OK in practice.
+    # We use 10 workers + a semaphore so we never hammer more than 10 calls at once.
+    # Each worker already has exponential backoff on 429, so spikes are handled
+    # gracefully. This is ~3× faster than the old 3-worker "sequential-ish" approach.
+    _gemini_sem = threading.Semaphore(10)   # max concurrent Gemini HTTP calls
+
+    def _parse_one_throttled(uname_profile):
+        with _gemini_sem:
+            return _parse_one(uname_profile)
+
+    result_queue: queue.Queue = queue.Queue()
+
+    def _worker(item):
+        result = _parse_one_throttled(item)
+        result_queue.put(result)
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = [ex.submit(_worker, item) for item in all_profiles.items()]
+        received = 0
+        while received < total_to_parse:
+            uname, prof, extra, gem = result_queue.get()
             gem_results[uname] = (prof, extra, gem)
             parsed_count += 1
+            received += 1
             yield {"type": "progress", "stage": "gemini",
                    "detail": f"AI parsed {parsed_count} / {total_to_parse} profiles…",
                    "validated": parsed_count, "total_candidates": total_to_parse}
@@ -1337,8 +1752,10 @@ def run_pipeline(hashtags, niche, geo_filter, limit, debug_mode=False,
             bio      = prof.get("bio", "")
             url      = prof.get("external_url", "")
 
-            # Prefer Gemini-extracted fields, fall back to regex
-            wa_number = gem.get("whatsapp_number") or extract_wa_number(bio, extra)
+            # Prefer Gemini-extracted fields, fall back to regex.
+            # Pass url explicitly so wa.me profile links are parsed even if
+            # extra was built from a different source (e.g. a linktree page).
+            wa_number = gem.get("whatsapp_number") or extract_wa_number(bio, f"{url} {extra}".strip())
             city      = gem.get("city") or extract_city(bio, prof.get("full_name", ""))
             state     = gem.get("state", "")
             category  = gem.get("category") or prof.get("ig_category") or "—"
